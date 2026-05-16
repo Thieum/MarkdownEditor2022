@@ -30,16 +30,15 @@ namespace MarkdownEditor2022
             .UsePragmaLines()
             .UsePreciseSourceLocation()
             .UseYamlFrontMatter()
-            .UseEmojiAndSmiley()
+            .UseEmojiAndSmiley(enableSmileys: false)
             .Build();
 
         public static MarkdownPipeline PipelineToGenerateHtml { get; } = new MarkdownPipelineBuilder()
             .UseAutoIdentifiers(AutoIdentifierOptions.GitHub)  // Must be BEFORE UseAdvancedExtensions to override default
             .UseAdvancedExtensions()
             .UseTocToken()  // Support for [[_TOC_]] Azure DevOps wiki syntax
-            .UsePreciseSourceLocation()
             .UseYamlFrontMatter()
-            .UseEmojiAndSmiley()
+            .UseEmojiAndSmiley(enableSmileys: false)
             .Build();
 
         // Compiled regex for better performance

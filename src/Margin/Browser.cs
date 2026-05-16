@@ -6,6 +6,7 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -17,6 +18,7 @@ using Markdig.Extensions.Yaml;
 using Markdig.Renderers;
 using Markdig.Syntax;
 using Microsoft.VisualStudio.PlatformUI;
+using Microsoft.VisualStudio.Text;
 using Microsoft.VisualStudio.Text.Classification;
 using Microsoft.VisualStudio.Text.Editor;
 using Microsoft.Web.WebView2.Core;
@@ -46,7 +48,7 @@ namespace MarkdownEditor2022
         private static readonly string[] _markdownExtensions = [".md", ".markdown", ".mdown", ".mkd"];
         private static readonly string[] _mermaidExtensions = [".mermaid", ".mmd"];
 
-        public readonly WebView2 _browser = new() { HorizontalAlignment = HorizontalAlignment.Stretch, Margin = new Thickness(0), Visibility = Visibility.Hidden };
+        public readonly WebView2CompositionControl _browser = new() { HorizontalAlignment = HorizontalAlignment.Stretch, Margin = new Thickness(0), Visibility = Visibility.Hidden };
 
 
         /// <summary>
@@ -61,9 +63,29 @@ namespace MarkdownEditor2022
         private DateTime _lastClickNavigationTime = DateTime.MinValue;
 
         /// <summary>
+        /// Timestamp of the last programmatic scroll of the preview. Used to suppress the editor's
+        /// LayoutChanged handler from re-triggering scroll sync, which would create a feedback loop.
+        /// </summary>
+        private DateTime _lastPreviewScrollTime = DateTime.MinValue;
+
+        /// <summary>
         /// Duration to suppress scroll sync after a click navigation to prevent the preview from scrolling away.
         /// </summary>
         private static readonly TimeSpan _scrollSyncSuppressionDuration = TimeSpan.FromMilliseconds(1000);
+
+        /// <summary>
+        /// Duration to suppress editor-to-preview scroll sync after a programmatic preview scroll,
+        /// preventing the feedback loop where preview scroll → editor layout change → preview scroll.
+        /// </summary>
+        private static readonly TimeSpan _scrollLoopSuppressionDuration = TimeSpan.FromMilliseconds(500);
+
+        /// <summary>
+        /// Returns true if scroll sync from the editor to the preview should be suppressed
+        /// because the preview was recently scrolled programmatically.
+        /// </summary>
+        public bool IsScrollSyncSuppressed =>
+            DateTime.UtcNow - _lastPreviewScrollTime < _scrollLoopSuppressionDuration ||
+            DateTime.UtcNow - _lastClickNavigationTime < _scrollSyncSuppressionDuration;
 
         // Cache StringBuilder pool and Regex for better performance
         // Note: StringWriter is created per-render from pooled StringBuilder for thread-safety
@@ -73,16 +95,27 @@ namespace MarkdownEditor2022
         private static readonly Regex _escapeRegex = new(@"[\\\r\n""]", RegexOptions.Compiled | RegexOptions.CultureInvariant);
         private static readonly ConcurrentDictionary<string, string> _templateCache = new();
 
+        // Regex for VS Code-style line-link fragments: #L10 or #L10,5 (also accepts L10:5).
+        private static readonly Regex _lineLinkFragmentRegex = new(
+            @"^L(?<line>\d+)(?:[,:](?<col>\d+))?$",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
         // Regex for resolving relative paths in HTML attributes to absolute file:// URLs
-        // Matches src="..." and href="..." attributes with relative paths (not starting with http, https, data, #, or /)
-        private static readonly Regex _relativePathRegex = new(
-            @"(?<attr>src|href)\s*=\s*""(?<path>(?!https?://|data:|#|/)[^""]+)""",
+        // Matches src="...", href="...", and data="..." attributes with relative paths (not starting with http, https, data:, #, or /)
+        internal static readonly Regex _relativePathRegex = new(
+            @"(?<attr>src|href|data)\s*=\s*""(?<path>(?!https?://|data:|#|/)[^""]+)""",
             RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
 
         // Regex for resolving root-relative paths (paths starting with /) in HTML attributes
-        // Matches src="..." and href="..." attributes with paths starting with / (but not //)
-        private static readonly Regex _rootRelativePathRegex = new(
-            @"(?<attr>src|href)\s*=\s*""(?<path>/(?!/)[^""]+)""",
+        // Matches src="...", href="...", and data="..." attributes with paths starting with / (but not //)
+        internal static readonly Regex _rootRelativePathRegex = new(
+            @"(?<attr>src|href|data)\s*=\s*""(?<path>/(?!/)[^""]+)""",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+        // Regex for resolving relative paths in CSS url() references
+        // Matches url("...") or url('...') or url(...) with relative paths (not starting with http, https, data:, or /)
+        private static readonly Regex _cssUrlRegex = new(
+            @"url\(\s*['""]?(?<path>(?!https?://|data:|/)[^'"")\s]+)['""]?\s*\)",
             RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
 
         // PrismJS language alias mappings (based on components.json from PrismJS)
@@ -353,6 +386,33 @@ namespace MarkdownEditor2022
         // Cache WebView2 environment for faster initialization of subsequent instances
         private static Task<CoreWebView2Environment> _cachedEnvironmentTask;
         private static readonly object _environmentLock = new();
+        private static bool _nativeDllSearchPathConfigured;
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool SetDllDirectory(string lpPathName);
+
+        /// <summary>
+        /// Adds the architecture-specific runtimes directory to the DLL search path so that
+        /// WebView2Loader.dll can be found when packaged inside the VSIX under runtimes\win-{arch}\native\.
+        /// </summary>
+        internal static void EnsureNativeDllSearchPath()
+        {
+            if (_nativeDllSearchPathConfigured)
+            {
+                return;
+            }
+
+            _nativeDllSearchPathConfigured = true;
+
+            string extensionDir = GetFolder();
+            string arch = Environment.Is64BitProcess ? "x64" : "x86";
+            string nativeDir = Path.Combine(extensionDir, "runtimes", $"win-{arch}", "native");
+
+            if (Directory.Exists(nativeDir))
+            {
+                SetDllDirectory(nativeDir);
+            }
+        }
 
         // Pending fragment navigations for cross-document links
         // When a markdown file is opened with a fragment (e.g., file.md#heading), store the fragment here
@@ -464,7 +524,7 @@ namespace MarkdownEditor2022
         /// <summary>
         /// Forces a full HTML reload including CSS, used when theme changes.
         /// </summary>
-        private async Task ForceFullRefreshAsync()
+        public async Task ForceFullRefreshAsync()
         {
             try
             {
@@ -725,8 +785,13 @@ namespace MarkdownEditor2022
             fragment = fragment?.TrimStart('#');
             bool hasFragment = !string.IsNullOrEmpty(fragment);
 
+            // Check for VS Code-style line link (#L10 or #L10,5).
+            int targetLine = 0;
+            int targetColumn = 0;
+            bool isLineLink = hasFragment && TryParseLineFragment(fragment, out targetLine, out targetColumn);
+
             // Check if this is an internal anchor (same file with fragment)
-            if (hasFragment && filePath.Equals(_file, StringComparison.OrdinalIgnoreCase))
+            if (hasFragment && !isLineLink && filePath.Equals(_file, StringComparison.OrdinalIgnoreCase))
             {
                 await NavigateToFragmentAsync(fragment);
                 return;
@@ -735,12 +800,19 @@ namespace MarkdownEditor2022
             // File exists - open it
             if (File.Exists(filePath))
             {
-                // Store pending fragment navigation before opening the file
-                if (hasFragment)
+                if (isLineLink)
                 {
-                    _pendingFragmentNavigations[filePath] = fragment;
+                    await OpenAndGoToLineAsync(filePath, targetLine, targetColumn);
                 }
-                VS.Documents.OpenInPreviewTabAsync(filePath).FireAndForget();
+                else
+                {
+                    // Store pending fragment navigation before opening the file
+                    if (hasFragment)
+                    {
+                        _pendingFragmentNavigations[Path.GetFullPath(filePath)] = fragment;
+                    }
+                    VS.Documents.OpenInPreviewTabAsync(filePath).FireAndForget();
+                }
                 return;
             }
 
@@ -752,12 +824,19 @@ namespace MarkdownEditor2022
                     string withExt = filePath + ext;
                     if (File.Exists(withExt))
                     {
-                        // Store pending fragment navigation before opening the file
-                        if (hasFragment)
+                        if (isLineLink)
                         {
-                            _pendingFragmentNavigations[withExt] = fragment;
+                            await OpenAndGoToLineAsync(withExt, targetLine, targetColumn);
                         }
-                        VS.Documents.OpenInPreviewTabAsync(withExt).FireAndForget();
+                        else
+                        {
+                            // Store pending fragment navigation before opening the file
+                            if (hasFragment)
+                            {
+                                _pendingFragmentNavigations[Path.GetFullPath(withExt)] = fragment;
+                            }
+                            VS.Documents.OpenInPreviewTabAsync(withExt).FireAndForget();
+                        }
                         return;
                     }
                 }
@@ -766,6 +845,69 @@ namespace MarkdownEditor2022
             // File doesn't exist - offer to create it if it's a markdown file
             string currentDir = Path.GetDirectoryName(_file);
             await HandleNonExistentMarkdownLinkAsync(filePath, currentDir);
+        }
+
+        /// <summary>
+        /// Parses a VS Code-style line-link fragment (e.g. "L10" or "L10,5" or "L10:5").
+        /// Returns true with 1-based <paramref name="line"/> and <paramref name="column"/> on success.
+        /// </summary>
+        private static bool TryParseLineFragment(string fragment, out int line, out int column)
+        {
+            line = 0;
+            column = 0;
+            if (string.IsNullOrEmpty(fragment))
+            {
+                return false;
+            }
+
+            Match m = _lineLinkFragmentRegex.Match(fragment);
+            if (!m.Success)
+            {
+                return false;
+            }
+
+            if (!int.TryParse(m.Groups["line"].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out line) || line < 1)
+            {
+                line = 0;
+                return false;
+            }
+
+            if (m.Groups["col"].Success &&
+                int.TryParse(m.Groups["col"].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out int parsedCol) &&
+                parsedCol >= 1)
+            {
+                column = parsedCol;
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// Opens the specified file in a preview tab and moves the caret to the given 1-based line/column.
+        /// </summary>
+        private static async Task OpenAndGoToLineAsync(string filePath, int line, int column)
+        {
+            DocumentView docView = await VS.Documents.OpenInPreviewTabAsync(filePath);
+            IWpfTextView textView = docView?.TextView;
+            if (textView == null)
+            {
+                return;
+            }
+
+            ITextSnapshot snapshot = textView.TextSnapshot;
+            if (snapshot.LineCount == 0)
+            {
+                return;
+            }
+
+            int lineIndex = Math.Min(Math.Max(line - 1, 0), snapshot.LineCount - 1);
+            ITextSnapshotLine snapLine = snapshot.GetLineFromLineNumber(lineIndex);
+            int columnOffset = column > 0 ? Math.Min(column - 1, snapLine.Length) : 0;
+            SnapshotPoint point = new(snapshot, snapLine.Start.Position + columnOffset);
+
+            textView.Caret.MoveTo(point);
+            textView.ViewScroller.EnsureSpanVisible(new SnapshotSpan(point, 0), EnsureSpanVisibleOptions.AlwaysCenter);
+            textView.VisualElement.Focus();
         }
 
         private async Task NavigateToFragmentAsync(string fragmentId)
@@ -924,9 +1066,9 @@ namespace MarkdownEditor2022
 
         public Task UpdatePositionAsync(int line, bool isTyping)
         {
-            // Suppress scroll sync briefly after a click-to-navigate action
-            // to prevent the preview from scrolling away from where the user clicked
-            return DateTime.UtcNow - _lastClickNavigationTime < _scrollSyncSuppressionDuration
+            // Suppress scroll sync when the preview was recently scrolled programmatically
+            // (prevents feedback loop) or after a click-to-navigate action
+            return IsScrollSyncSuppressed
                 ? Task.CompletedTask
                 : _currentViewLine == line
                 ? Task.CompletedTask
@@ -945,6 +1087,7 @@ namespace MarkdownEditor2022
                 {
                     // Forces the preview window to scroll to the top of the document
                     await _browser.ExecuteScriptAsync("document.documentElement.scrollTop=0;");
+                    _lastPreviewScrollTime = DateTime.UtcNow;
                 }
                 else
                 {
@@ -964,6 +1107,7 @@ namespace MarkdownEditor2022
                     else
                     {
                         await _browser.ExecuteScriptAsync($@"document.getElementById(""pragma-line-{_currentViewLine}"").scrollIntoView(true);");
+                        _lastPreviewScrollTime = DateTime.UtcNow;
                     }
                 }
             }
@@ -1022,7 +1166,7 @@ namespace MarkdownEditor2022
                 await UpdateContentAsync(html);
 
                 // Check for pending cross-document fragment navigation
-                if (!string.IsNullOrWhiteSpace(_file) && _pendingFragmentNavigations.TryRemove(_file, out string pendingFragment))
+                if (!string.IsNullOrWhiteSpace(_file) && _pendingFragmentNavigations.TryRemove(Path.GetFullPath(_file), out string pendingFragment))
                 {
                     // Small delay to ensure content is fully rendered before scrolling
                     await Task.Delay(100);
@@ -1145,9 +1289,10 @@ namespace MarkdownEditor2022
                 return html;
             }
 
-            // Early exit if no src= or href= attributes to process (avoids regex scan)
+            // Early exit if no src=, href=, or data= attributes to process (avoids regex scan)
             if (html.IndexOf("src=", StringComparison.OrdinalIgnoreCase) < 0 &&
-                html.IndexOf("href=", StringComparison.OrdinalIgnoreCase) < 0)
+                html.IndexOf("href=", StringComparison.OrdinalIgnoreCase) < 0 &&
+                html.IndexOf("data=", StringComparison.OrdinalIgnoreCase) < 0)
             {
                 return html;
             }
@@ -1170,24 +1315,7 @@ namespace MarkdownEditor2022
 
                     try
                     {
-                        // Only decode if path contains encoded characters (avoid allocation otherwise)
-                        string decodedPath = relativePath.IndexOf('%') >= 0
-                            ? WebUtility.UrlDecode(relativePath)
-                            : relativePath;
-
-                        // Remove leading slash and normalize path separators
-                        string pathWithoutLeadingSlash = decodedPath.TrimStart('/');
-                        pathWithoutLeadingSlash = pathWithoutLeadingSlash.Replace('/', Path.DirectorySeparatorChar);
-
-                        // Resolve against the root path
-                        string fullPath = Path.GetFullPath(Path.Combine(rootPath, pathWithoutLeadingSlash));
-
-                        // Convert to virtual host URL relative to drive root
-                        string relativeToDrive = fullPath.StartsWith(driveRoot, StringComparison.OrdinalIgnoreCase)
-                            ? fullPath.Substring(driveRoot.Length)
-                            : fullPath;
-
-                        return string.Concat(attr, "=\"", _virtualHostUrlPrefix, relativeToDrive.Replace(Path.DirectorySeparatorChar, '/'), "\"");
+                        return ResolveRootRelativePath(attr, relativePath, rootPath, driveRoot);
                     }
                     catch
                     {
@@ -1203,32 +1331,15 @@ namespace MarkdownEditor2022
                 string attr = match.Groups["attr"].Value;
                 string relativePath = match.Groups["path"].Value;
 
-                // Skip if it's an anchor-only link or already absolute
-                if (string.IsNullOrEmpty(relativePath) || relativePath.StartsWith("#"))
+                // Skip if it's an anchor-only link, already absolute, or a URI scheme (mailto:, tel:, mail:, etc.)
+                if (string.IsNullOrEmpty(relativePath) || relativePath.StartsWith("#") || relativePath.IndexOf(':') >= 0)
                 {
                     return match.Value;
                 }
 
                 try
                 {
-                    // Only decode if path contains encoded characters (avoid allocation otherwise)
-                    string decodedPath = relativePath.IndexOf('%') >= 0
-                        ? WebUtility.UrlDecode(relativePath)
-                        : relativePath;
-
-                    // Normalize path separators
-                    decodedPath = decodedPath.Replace('/', Path.DirectorySeparatorChar);
-
-                    // Resolve the full path using Path.GetFullPath which handles ../ correctly
-                    string fullPath = Path.GetFullPath(Path.Combine(baseDirectory, decodedPath));
-
-                    // Convert to virtual host URL relative to drive root
-                    // e.g., C:\Projects\images\foo.png -> http://browsing-file-host/Projects/images/foo.png
-                    string relativeToDrive = fullPath.StartsWith(driveRoot, StringComparison.OrdinalIgnoreCase)
-                        ? fullPath.Substring(driveRoot.Length)
-                        : fullPath;
-
-                    return string.Concat(attr, "=\"", _virtualHostUrlPrefix, relativeToDrive.Replace(Path.DirectorySeparatorChar, '/'), "\"");
+                    return ResolveRelativePath(attr, relativePath, baseDirectory, driveRoot);
                 }
                 catch
                 {
@@ -1238,6 +1349,112 @@ namespace MarkdownEditor2022
             });
 
             return html;
+        }
+
+        /// <summary>Resolves a regular relative path to a virtual host URL attribute string.</summary>
+        internal static string ResolveRelativePath(string attr, string relativePath, string baseDirectory, string driveRoot)
+        {
+            string decodedPath = relativePath.IndexOf('%') >= 0
+                ? WebUtility.UrlDecode(relativePath)
+                : relativePath;
+
+            // Normalize path separators
+            decodedPath = decodedPath.Replace('/', Path.DirectorySeparatorChar);
+
+            // Resolve the full path using Path.GetFullPath which handles ../ correctly
+            string fullPath = Path.GetFullPath(Path.Combine(baseDirectory, decodedPath));
+
+            // Convert to virtual host URL relative to drive root
+            // e.g., C:\Projects\images\foo.png -> http://browsing-file-host/Projects/images/foo.png
+            string relativeToDrive = fullPath.StartsWith(driveRoot, StringComparison.OrdinalIgnoreCase)
+                ? fullPath.Substring(driveRoot.Length)
+                : fullPath;
+
+            return string.Concat(attr, "=\"", _virtualHostUrlPrefix, relativeToDrive.Replace(Path.DirectorySeparatorChar, '/'), "\"");
+        }
+
+        /// <summary>Resolves a root-relative path (starting with /) to a virtual host URL attribute string.</summary>
+        internal static string ResolveRootRelativePath(string attr, string relativePath, string rootPath, string driveRoot)
+        {
+            // Only decode if path contains encoded characters (avoid allocation otherwise)
+            string decodedPath = relativePath.IndexOf('%') >= 0
+                ? WebUtility.UrlDecode(relativePath)
+                : relativePath;
+
+            // Remove leading slash and normalize path separators
+            string pathWithoutLeadingSlash = decodedPath.TrimStart('/');
+            pathWithoutLeadingSlash = pathWithoutLeadingSlash.Replace('/', Path.DirectorySeparatorChar);
+
+            // Resolve against the root path
+            string fullPath = Path.GetFullPath(Path.Combine(rootPath, pathWithoutLeadingSlash));
+
+            // Convert to virtual host URL relative to drive root
+            string relativeToDrive = fullPath.StartsWith(driveRoot, StringComparison.OrdinalIgnoreCase)
+                ? fullPath.Substring(driveRoot.Length)
+                : fullPath;
+
+            return string.Concat(attr, "=\"", _virtualHostUrlPrefix, relativeToDrive.Replace(Path.DirectorySeparatorChar, '/'), "\"");
+        }
+
+        /// <summary>
+        /// Resolves relative paths in CSS url() references to absolute virtual host URLs.
+        /// This allows custom stylesheets to reference local font files, images, etc.
+        /// </summary>
+        /// <param name="css">The CSS content with potentially relative url() paths.</param>
+        /// <param name="cssDirectory">The directory containing the CSS file.</param>
+        /// <returns>CSS with relative url() paths converted to absolute virtual host URLs.</returns>
+        private static string ResolveCssUrls(string css, string cssDirectory)
+        {
+            if (string.IsNullOrEmpty(css) || string.IsNullOrEmpty(cssDirectory))
+            {
+                return css;
+            }
+
+            // Early exit if no url() references to process
+            if (css.IndexOf("url(", StringComparison.OrdinalIgnoreCase) < 0)
+            {
+                return css;
+            }
+
+            string driveRoot = Path.GetPathRoot(cssDirectory);
+
+            return _cssUrlRegex.Replace(css, match =>
+            {
+                string relativePath = match.Groups["path"].Value;
+
+                // Skip if empty
+                if (string.IsNullOrEmpty(relativePath))
+                {
+                    return match.Value;
+                }
+
+                try
+                {
+                    // Decode URL-encoded characters if present
+                    string decodedPath = relativePath.IndexOf('%') >= 0
+                        ? WebUtility.UrlDecode(relativePath)
+                        : relativePath;
+
+                    // Normalize path separators for Path.Combine
+                    string normalizedPath = decodedPath.Replace('/', Path.DirectorySeparatorChar);
+
+                    // Resolve relative path against CSS directory
+                    string fullPath = Path.GetFullPath(Path.Combine(cssDirectory, normalizedPath));
+
+                    // Get path relative to drive root for virtual host mapping
+                    string relativeToDrive = fullPath.StartsWith(driveRoot, StringComparison.OrdinalIgnoreCase)
+                        ? fullPath.Substring(driveRoot.Length)
+                        : fullPath;
+
+                    string absoluteUrl = _virtualHostUrlPrefix + relativeToDrive.Replace(Path.DirectorySeparatorChar, '/');
+                    return string.Concat("url(\"", absoluteUrl, "\")");
+                }
+                catch
+                {
+                    // If path resolution fails, keep the original
+                    return match.Value;
+                }
+            });
         }
 
         private async Task UpdateContentAsync(string html)
@@ -1269,8 +1486,9 @@ namespace MarkdownEditor2022
                 }
                 if (needsMath)
                 {
-                    // MathJax lazy load or re-typeset
-                    script.Append(@"if(!window.MathJax && !window.__mathjaxLoading){window.__mathjaxLoading=true;var sj=document.createElement('script');sj.src='http://").Append(_mappedMarkdownEditorVirtualHostName).Append(@"/margin/mathjax.js';sj.onload=function(){if(window.MathJax&&MathJax.typesetPromise){MathJax.typesetPromise().catch(function(e){});}};document.head.appendChild(sj);} else if(window.MathJax&&MathJax.typesetPromise){MathJax.typesetPromise().catch(function(e){});}");
+                    // MathJax lazy load or re-typeset. Configure tex/color extension before the bundle loads
+                    // so that \color, \textcolor, \colorbox and \fcolorbox work in math expressions (issue #219).
+                    script.Append(@"if(!window.MathJax && !window.__mathjaxLoading){window.__mathjaxLoading=true;window.MathJax={tex:{packages:{'[+]':['color']}},loader:{load:['[tex]/color'],paths:{tex:'http://").Append(_mappedMarkdownEditorVirtualHostName).Append(@"/margin'}}};var sj=document.createElement('script');sj.src='http://").Append(_mappedMarkdownEditorVirtualHostName).Append(@"/margin/mathjax.js';sj.onload=function(){if(window.MathJax&&MathJax.typesetPromise){MathJax.typesetPromise().catch(function(e){});}};document.head.appendChild(sj);} else if(window.MathJax&&MathJax.typesetPromise){MathJax.typesetPromise().catch(function(e){});}");
                 }
 
                 // Inline anchor adjustment
@@ -1309,6 +1527,8 @@ namespace MarkdownEditor2022
             }
             if (math)
             {
+                // Configure tex/color extension before MathJax bundle initializes (issue #219).
+                sb.Append("<script>window.MathJax={tex:{packages:{'[+]':['color']}},loader:{load:['[tex]/color'],paths:{tex:'http://").Append(_mappedMarkdownEditorVirtualHostName).Append("/margin'}}};</script>");
                 sb.Append("<script src=\"http://").Append(_mappedMarkdownEditorVirtualHostName).Append("/margin/mathjax.js\" onload=\"if(window.MathJax&&MathJax.typesetPromise){MathJax.typesetPromise().catch(function(e){});}\"></script>");
             }
             return sb.ToString();
@@ -1350,12 +1570,20 @@ namespace MarkdownEditor2022
                 // Use pre-warmed resources when available, fall back to file I/O
                 string templateRaw = GetTemplateContent(templateFileName);
                 string cssHighlight = GetHighlightCss(useLightTheme, usingCustomHighlight, highlightSourcePath);
+
+                // Resolve relative url() paths in custom CSS files (e.g., font-face references)
+                if (usingCustomHighlight)
+                {
+                    cssHighlight = ResolveCssUrls(cssHighlight, Path.GetDirectoryName(highlightSourcePath));
+                }
+
                 string cssPrism = GetPrismCss(useLightTheme, prismSourcePath);
 
                 string css = cssHighlight + cssPrism;
 
                 // Scrollbar styling for WebView2 (Chromium-based)
                 string scrollbarCss = $@"
+        html {{ scrollbar-color: {scrollbarColor} {themeBgColor}; }}
         ::-webkit-scrollbar {{ width: 14px; height: 14px; }}
         ::-webkit-scrollbar-track {{ background: {themeBgColor}; }}
         ::-webkit-scrollbar-thumb {{ background: {scrollbarColor}; border: 3px solid {themeBgColor}; border-radius: 7px; }}
@@ -1645,7 +1873,7 @@ namespace MarkdownEditor2022
         /// <summary>
         /// Gets or creates a cached WebView2 environment for faster initialization of subsequent browser instances.
         /// </summary>
-        private static Task<CoreWebView2Environment> GetOrCreateWebView2EnvironmentAsync()
+        internal static Task<CoreWebView2Environment> GetOrCreateWebView2EnvironmentAsync()
         {
             if (_cachedEnvironmentTask != null)
             {
@@ -1660,7 +1888,14 @@ namespace MarkdownEditor2022
                 }
 
                 string tempDir = Path.Combine(Path.GetTempPath(), Assembly.GetExecutingAssembly().GetName().Name);
-                _cachedEnvironmentTask = CoreWebView2Environment.CreateAsync(browserExecutableFolder: null, userDataFolder: tempDir, options: null);
+                // Disable overlay scrollbars so ::-webkit-scrollbar CSS pseudo-elements work correctly
+                // in WebView2CompositionControl (overlay scrollbars ignore custom scrollbar styling)
+                CoreWebView2EnvironmentOptions options = new()
+                {
+                    AdditionalBrowserArguments = "--disable-features=OverlayScrollbar"
+                };
+                EnsureNativeDllSearchPath();
+                _cachedEnvironmentTask = CoreWebView2Environment.CreateAsync(browserExecutableFolder: null, userDataFolder: tempDir, options: options);
                 return _cachedEnvironmentTask;
             }
         }

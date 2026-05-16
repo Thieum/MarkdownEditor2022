@@ -45,6 +45,7 @@ This extension delivers a full featured Markdown editor with live preview, synta
 - Jump between headings from the NavigationBar, Document Outline, or generated table of contents.
 - Document Outline tool window shows a persistent hierarchical view of all headings.
 - Collapse or expand fenced code and HTML blocks to stay focused.
+- Follow VS Code-style line links (`[link](./file.cs#L10)`) to open a file and jump to a specific line and column.
 
 ### Media workflows
 
@@ -72,12 +73,6 @@ Every time the markdown document is modified, the preview window will update.
 The preview window is automatically scrolled to match the scroll position of the document. As the document is scrolled up and down, the preview window will follow.
 
 Live preview can be managed in the [settings](#settings).
-
-#### Auto-hide tool window support
-
-The preview window uses WebView2 which, due to its HWND-based rendering, can overlap Visual Studio's auto-hide tool windows (like Solution Explorer when pinned to auto-hide). To mitigate this, enable **Auto-hide for tool windows** in the settings.
-
-When enabled, the preview temporarily hides when you expand an auto-hide tool window, and automatically reappears when the tool window collapses back. This ensures you can always interact with your tool windows without the preview getting in the way.
 
 ### Syntax highlighting
 
@@ -348,6 +343,17 @@ The Document Outline complements the NavigationBar dropdown by providing an alwa
 
 ![Document outline window](art/document-outline.png)
 
+### Line links to source files
+
+Links to local files in the preview can include a VS Code-style line fragment to jump straight to a specific location when the file is opened. This is especially useful when an AI assistant generates links into your codebase.
+
+**Syntax:**
+
+- `[link](./path/to/file.cs#L10)` &mdash; opens `file.cs` and places the caret on line 10.
+- `[link](./path/to/file.cs#L10,5)` &mdash; opens `file.cs` and places the caret on line 10, column 5. `#L10:5` is also accepted.
+
+Line and column numbers are 1-based and are clamped to the file's contents, so out-of-range values still open the file at the closest valid position. The targeted line is centered in the editor and focus is moved to the opened document.
+
 ### Drag 'n drop images
 
 Drag an image directly from Solution Explorer onto the document to insert the appropriate markdown that will render the image.
@@ -486,7 +492,6 @@ Control the settings for this extension under
 | Enable scroll sync          | Synchronizes scrolling between the editor and preview                                            |
 | Preview window position     | Choose between right-side or bottom placement                                                    |
 | Preview window width/height | Set the size of the preview pane                                                                 |
-| Auto-hide for tool windows  | Temporarily hides the preview when auto-hide tool windows expand, preventing overlap issues      |
 | Enable table sorting        | Allows double-clicking table headers to sort columns (underlines headers when enabled)           |
 | Optimize images on paste    | Automatically optimizes pasted images using Image Optimizer (requires Image Optimizer extension) |
 | Show trailing whitespace    | Displays dots for trailing double-spaces (soft line breaks) in the editor                        |

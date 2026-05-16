@@ -541,31 +541,75 @@ namespace MarkdownEditor2022.UnitTests
             }
         }
 
-        [TestMethod]
-        public void HtmlGenerationEnabled_WhenHtmlSiblingExists_ReturnsTrue()
+        #endregion
+
+        #region URI Scheme Path Resolution Tests
+
+        /// <summary>
+        /// Exercises the relative-path resolution logic from Browser.cs WITHOUT the catch block,
+        /// so that guard omissions (e.g. missing URI-scheme check) surface as test failures
+        /// rather than being silently swallowed.
+        /// </summary>
+        private static string ResolveRelativePaths(string html, string baseDirectory)
         {
-            string tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N"));
-            Directory.CreateDirectory(tempDir);
+            string driveRoot = Path.GetPathRoot(baseDirectory);
 
-            try
+            return Browser._relativePathRegex.Replace(html, match =>
             {
-                string markdownFile = Path.Combine(tempDir, "readme.md");
-                string htmlFile = Path.Combine(tempDir, "readme.html");
+                string attr = match.Groups["attr"].Value;
+                string relativePath = match.Groups["path"].Value;
 
-                File.WriteAllText(markdownFile, "# Title");
-                File.WriteAllText(htmlFile, "<html></html>");
+                if (string.IsNullOrEmpty(relativePath) || relativePath.StartsWith("#") || relativePath.IndexOf(':') >= 0)
+                    return match.Value;
 
-                bool result = HtmlGenerationService.HtmlGenerationEnabled(markdownFile);
+                return Browser.ResolveRelativePath(attr, relativePath, baseDirectory, driveRoot);
+            });
+        }
 
-                Assert.IsTrue(result);
-            }
-            finally
-            {
-                if (Directory.Exists(tempDir))
-                {
-                    Directory.Delete(tempDir, true);
-                }
-            }
+        [TestMethod]
+        public void ResolveRelativePaths_MailtoLink_IsNotModified()
+        {
+            // Regression: href="mail:user@example.com" caused NotSupportedException
+            // because "mail:user@example.com" looks like a drive path on Windows.
+            string html = @"<a href=""mail:user@example.com"">Contact</a>";
+            string baseDir = @"C:\Projects\docs";
+
+            string result = ResolveRelativePaths(html, baseDir);
+
+            Assert.AreEqual(html, result, "mailto-style URI scheme links must not be modified.");
+        }
+
+        [TestMethod]
+        public void ResolveRelativePaths_TelLink_IsNotModified()
+        {
+            string html = @"<a href=""tel:+15551234567"">Call us</a>";
+            string baseDir = @"C:\Projects\docs";
+
+            string result = ResolveRelativePaths(html, baseDir);
+
+            Assert.AreEqual(html, result, "tel: URI scheme links must not be modified.");
+        }
+
+        [TestMethod]
+        public void ResolveRelativePaths_MailtoLink_IsNotModified2()
+        {
+            string html = @"<a href=""mailto:user@example.com"">Email</a>";
+            string baseDir = @"C:\Projects\docs";
+
+            string result = ResolveRelativePaths(html, baseDir);
+
+            Assert.AreEqual(html, result, "mailto: URI scheme links must not be modified.");
+        }
+
+        [TestMethod]
+        public void ResolveRelativePaths_NormalRelativePath_IsResolved()
+        {
+            string html = @"<img src=""images/photo.png"">";
+            string baseDir = @"C:\Projects\docs";
+
+            string result = ResolveRelativePaths(html, baseDir);
+
+            StringAssert.StartsWith(result, @"<img src=""http://browsing-file-host/");
         }
 
         #endregion

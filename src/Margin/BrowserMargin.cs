@@ -8,12 +8,11 @@ using Microsoft.VisualStudio.Text.Editor;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.Wpf;
 
-#pragma warning disable VSTHRD001 // Avoid legacy thread switching APIs - Dispatcher.InvokeAsync is correct for WPF
 #pragma warning disable VSSDK007 // Use JoinableTaskFactory - fire-and-forget is intentional here
 
 namespace MarkdownEditor2022
 {
-    public class BrowserMargin : DockPanel, IWpfTextViewMargin, AutoHideWindowMonitor.IAutoHideWindowListener
+    public class BrowserMargin : DockPanel, IWpfTextViewMargin
     {
         private readonly Document _document;
         private readonly ITextView _textView;
@@ -22,8 +21,11 @@ namespace MarkdownEditor2022
         private bool _isDisposed;
         private DateTime _lastEdit;
         private readonly Debouncer _debouncer = new(150); // Per-instance debouncer for correct behavior with multiple documents
-        private bool _isPreviewHiddenByAutoHide;
-        private bool _isRegisteredWithAutoHideMonitor;
+        private Grid _browserHost;
+        private int _browserHostColumn;
+        private int _browserHostRow;
+        private bool _browserAttached;
+        private bool _browserAttachQueued;
 
         public FrameworkElement VisualElement => this;
         public double MarginSize => 400; // Initial size, actual size is calculated from percentage
@@ -41,24 +43,103 @@ namespace MarkdownEditor2022
 
             Browser = new Browser(textview.TextBuffer.GetFileName(), _document, textview as IWpfTextView, formatMapService);
             Browser._browser.CoreWebView2InitializationCompleted += OnBrowserInitCompleted;
+            Dispatcher.UnhandledException += OnDispatcherUnhandledException;
 
-            CreateMarginControls(Browser._browser);
+            // Defer adding the WebView2CompositionControl to the visual tree until this margin
+            // is fully parented under a Window. WebView2CompositionControl.Loaded calls
+            // Window.GetWindow(this) which returns null if the control loads before the VS
+            // tool window is parented, causing a NullReferenceException.
+            CreateMarginControls();
+            QueueBrowserAttach();
         }
 
-
-        private async Task InitializeAutoHideMonitorAsync()
+        private void OnMarginLoaded(object sender, RoutedEventArgs e)
         {
-            if (_isRegisteredWithAutoHideMonitor)
+            TryAttachBrowser();
+        }
+
+        private void OnLayoutUpdatedUntilBrowserAttached(object sender, EventArgs e)
+        {
+            TryAttachBrowser();
+        }
+
+        private void QueueBrowserAttach()
+        {
+            if (_isDisposed || _browserAttached || _browserAttachQueued)
             {
                 return;
             }
 
-            await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
-            AutoHideWindowMonitor monitor = AutoHideWindowMonitor.GetInstance();
-            monitor.Initialize();
-            monitor.AddListener(this);
-            _isRegisteredWithAutoHideMonitor = true;
+            _browserAttachQueued = true;
+            Loaded += OnMarginLoaded;
+            LayoutUpdated += OnLayoutUpdatedUntilBrowserAttached;
+            TryAttachBrowser();
         }
+
+        private void TryAttachBrowser()
+        {
+            try
+            {
+                if (_isDisposed || _browserAttached || _browserHost == null || Window.GetWindow(this) == null)
+                {
+                    return;
+                }
+
+                Loaded -= OnMarginLoaded;
+                LayoutUpdated -= OnLayoutUpdatedUntilBrowserAttached;
+                _browserAttachQueued = false;
+
+                WebView2CompositionControl view = Browser._browser;
+
+                if (view.Parent is Panel parent)
+                {
+                    parent.Children.Remove(view);
+                }
+
+                Grid.SetColumn(view, _browserHostColumn);
+                Grid.SetRow(view, _browserHostRow);
+                _browserHost.Children.Add(view);
+                _browserAttached = true;
+            }
+            catch (Exception ex)
+            {
+                HandleBrowserFailure(ex);
+            }
+        }
+
+        private void OnDispatcherUnhandledException(object sender, System.Windows.Threading.DispatcherUnhandledExceptionEventArgs e)
+        {
+            if (!IsWebView2LoadedNullReference(e.Exception))
+            {
+                return;
+            }
+
+            e.Handled = true;
+            HandleBrowserFailure(e.Exception);
+        }
+
+        private static bool IsWebView2LoadedNullReference(Exception exception)
+        {
+            return exception is NullReferenceException &&
+                   string.Equals(exception.Source, "Microsoft.Web.WebView2.Wpf", StringComparison.OrdinalIgnoreCase) &&
+                   exception.StackTrace?.IndexOf("WebView2CompositionControl_Loaded", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private void HandleBrowserFailure(Exception exception)
+        {
+            Loaded -= OnMarginLoaded;
+            LayoutUpdated -= OnLayoutUpdatedUntilBrowserAttached;
+            _browserAttachQueued = false;
+
+            if (Browser?._browser?.Parent is Panel parent)
+            {
+                parent.Children.Remove(Browser._browser);
+            }
+
+            Visibility = Visibility.Collapsed;
+            exception?.LogAsync().FireAndForget();
+        }
+
 
         public void Dispose()
         {
@@ -68,6 +149,9 @@ namespace MarkdownEditor2022
             }
 
             Browser._browser.CoreWebView2InitializationCompleted -= OnBrowserInitCompleted;
+            Dispatcher.UnhandledException -= OnDispatcherUnhandledException;
+            Loaded -= OnMarginLoaded;
+            LayoutUpdated -= OnLayoutUpdatedUntilBrowserAttached;
             Browser.LineNavigationRequested -= OnLineNavigationRequested;
             _document.Parsed -= UpdateBrowser;
             _textView.LayoutChanged -= UpdatePosition;
@@ -75,67 +159,21 @@ namespace MarkdownEditor2022
             VSColorTheme.ThemeChanged -= OnThemeChange;
             AdvancedOptions.Saved -= AdvancedOptions_Saved;
 
-            // Unsubscribe from auto-hide monitor only if we registered
-            if (_isRegisteredWithAutoHideMonitor)
-            {
-                AutoHideWindowMonitor.GetInstance().RemoveListener(this);
-                _isRegisteredWithAutoHideMonitor = false;
-            }
-
             Browser.Dispose();
             _debouncer?.Dispose();
 
             _isDisposed = true;
         }
 
-        /// <summary>
-        /// Called when an auto-hide tool window's visibility changes.
-        /// Hides the WebView2 preview when auto-hide windows slide into view to prevent overlap.
-        /// </summary>
-        public void OnAutoHideWindowVisibilityChanged(bool anyAutoHideWindowVisible)
-        {
-            if (_isDisposed || !AdvancedOptions.Instance.AutoHideOnFocusLoss)
-            {
-                return;
-            }
-
-            // Must update UI on dispatcher thread
-            _ = Browser._browser.Dispatcher.InvokeAsync(() =>
-            {
-                if (_isDisposed)
-                {
-                    return;
-                }
-
-                if (anyAutoHideWindowVisible)
-                {
-                    // Auto-hide window is sliding in - hide preview to prevent overlap
-                    if (Browser._browser.Visibility == Visibility.Visible)
-                    {
-                        _isPreviewHiddenByAutoHide = true;
-                        Browser._browser.Visibility = Visibility.Hidden;
-                    }
-                }
-                else
-                {
-                    // All auto-hide windows are hidden - restore preview
-                    if (_isPreviewHiddenByAutoHide)
-                    {
-                        _isPreviewHiddenByAutoHide = false;
-                        Browser._browser.Visibility = Visibility.Visible;
-                    }
-                }
-            });
-        }
-
         private void OnBrowserInitCompleted(object sender, CoreWebView2InitializationCompletedEventArgs e)
         {
             if (!e.IsSuccess)
             {
-                throw e.InitializationException;
+                HandleBrowserFailure(e.InitializationException ?? new InvalidOperationException("WebView2 initialization failed."));
+                return;
             }
 
-            WebView2 view = sender as WebView2;
+            WebView2CompositionControl view = sender as WebView2CompositionControl;
 
             view.SetResourceReference(BackgroundProperty, EnvironmentColors.ToolWindowBackgroundBrushKey);
 
@@ -147,13 +185,7 @@ namespace MarkdownEditor2022
             AdvancedOptions.Saved += AdvancedOptions_Saved;
             VSColorTheme.ThemeChanged += OnThemeChange;
 
-            // Initialize auto-hide monitor now that browser is ready (if enabled)
-            if (AdvancedOptions.Instance.AutoHideOnFocusLoss)
-            {
-                InitializeAutoHideMonitorAsync().FireAndForget();
-            }
-
-            // Browser performs its own initial render during WebView2 initialization.
+            // Browser performs its own initial render
             // Trigger an extra startup render only for standalone mermaid files,
             // which use a separate rendering path.
             if (IsStandaloneMermaidFile(_textView.TextBuffer.GetFileName()))
@@ -220,18 +252,18 @@ namespace MarkdownEditor2022
             }).FireAndForget();
         }
 
-        private void CreateMarginControls(WebView2 view)
+        private void CreateMarginControls()
         {
             if (AdvancedOptions.Instance.PreviewWindowLocation == PreviewLocation.Vertical)
             {
-                CreateRightMarginControls(view);
+                CreateRightMarginControls();
             }
             else
             {
-                CreateBottomMarginControls(view);
+                CreateBottomMarginControls();
             }
 
-            void CreateRightMarginControls(WebView2 view)
+            void CreateRightMarginControls()
             {
                 Grid grid = new();
                 grid.ColumnDefinitions.Add(new ColumnDefinition() { Width = new GridLength(0, GridUnitType.Star) });
@@ -242,9 +274,9 @@ namespace MarkdownEditor2022
 
                 Children.Add(grid);
 
-                grid.Children.Add(view);
-                Grid.SetColumn(view, 2);
-                Grid.SetRow(view, 0);
+                _browserHost = grid;
+                _browserHostColumn = 2;
+                _browserHostRow = 0;
 
                 bool isUpdating = false;
                 bool isDragging = false;
@@ -347,7 +379,7 @@ namespace MarkdownEditor2022
                 _ = ThreadHelper.JoinableTaskFactory.StartOnIdle(UpdateWidthFromPercentage);
             }
 
-            void CreateBottomMarginControls(WebView2 view)
+            void CreateBottomMarginControls()
             {
                 int height = AdvancedOptions.Instance.PreviewWindowHeight;
 
@@ -360,9 +392,9 @@ namespace MarkdownEditor2022
 
                 Children.Add(grid);
 
-                grid.Children.Add(view);
-                Grid.SetColumn(view, 0);
-                Grid.SetRow(view, 2);
+                _browserHost = grid;
+                _browserHostColumn = 0;
+                _browserHostRow = 2;
 
                 GridSplitter splitter = new()
                 {
@@ -384,7 +416,28 @@ namespace MarkdownEditor2022
         private void AdvancedOptions_Saved(AdvancedOptions options)
         {
             Browser.InvalidateThemeCache();
-            RefreshAsync().FireAndForget();
+            ForceRefreshAsync().FireAndForget();
+        }
+
+        private async Task ForceRefreshAsync()
+        {
+            AdvancedOptions opts = await AdvancedOptions.GetLiveInstanceAsync();
+
+            if (opts.EnablePreviewWindow)
+            {
+                Visibility = Visibility.Visible;
+                await Browser.ForceFullRefreshAsync();
+
+                if (opts.EnableScrollSync)
+                {
+                    int line = _textView.TextSnapshot.GetLineNumberFromPosition(_textView.TextViewLines.FirstVisibleLine.Start.Position);
+                    await Browser.UpdatePositionAsync(line, false);
+                }
+            }
+            else
+            {
+                Visibility = Visibility.Collapsed;
+            }
         }
 
         private void OnThemeChange(ThemeChangedEventArgs e)
@@ -417,6 +470,12 @@ namespace MarkdownEditor2022
         private void UpdatePosition(object sender, TextViewLayoutChangedEventArgs e)
         {
             if (!AdvancedOptions.Instance.EnableScrollSync)
+            {
+                return;
+            }
+
+            // Suppress if the preview was recently scrolled programmatically to prevent a feedback loop
+            if (Browser.IsScrollSyncSuppressed)
             {
                 return;
             }
