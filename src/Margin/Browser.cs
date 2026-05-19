@@ -842,9 +842,54 @@ namespace MarkdownEditor2022
                 }
             }
 
+            // Try replacing .html extension with markdown extensions
+            // Handles links like [About](aboutpage.html) that should open aboutpage.md
+            string mdForHtml = FindMarkdownFileForHtmlPath(filePath, File.Exists);
+            if (mdForHtml != null)
+            {
+                if (isLineLink)
+                {
+                    await OpenAndGoToLineAsync(mdForHtml, targetLine, targetColumn);
+                }
+                else
+                {
+                    if (hasFragment)
+                    {
+                        _pendingFragmentNavigations[Path.GetFullPath(mdForHtml)] = fragment;
+                    }
+                    VS.Documents.OpenInPreviewTabAsync(mdForHtml).FireAndForget();
+                }
+                return;
+            }
+
             // File doesn't exist - offer to create it if it's a markdown file
             string currentDir = Path.GetDirectoryName(_file);
             await HandleNonExistentMarkdownLinkAsync(filePath, currentDir);
+        }
+
+        /// <summary>
+        /// When a .html file is not found, tries to locate a corresponding markdown file
+        /// by replacing the .html extension with known markdown extensions.
+        /// Returns the first found path, or null if none exists.
+        /// </summary>
+        internal static string FindMarkdownFileForHtmlPath(string filePath, Func<string, bool> fileExists)
+        {
+            if (!Path.GetExtension(filePath).Equals(".html", StringComparison.OrdinalIgnoreCase))
+            {
+                return null;
+            }
+
+            string withoutExtension = Path.ChangeExtension(filePath, null);
+            foreach (string ext in _markdownExtensions)
+            {
+                string withExt = withoutExtension + ext;
+                if (fileExists(withExt))
+                {
+                    return withExt;
+                }
+            }
+
+            return null;
         }
 
         /// <summary>

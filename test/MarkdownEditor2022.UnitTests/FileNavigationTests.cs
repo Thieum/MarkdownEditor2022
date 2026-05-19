@@ -361,6 +361,89 @@ namespace MarkdownEditor2022.UnitTests
 
         #endregion
 
+        #region HTML Extension Fallback Tests
+
+        [TestMethod]
+        public void FindMarkdownFileForHtmlPath_HtmlExtension_FindsMdFile()
+        {
+            string filePath = @"C:\Projects\Docs\aboutpage.html";
+            bool fileExists(string path) => path == @"C:\Projects\Docs\aboutpage.md";
+
+            string result = Browser.FindMarkdownFileForHtmlPath(filePath, fileExists);
+
+            Assert.AreEqual(@"C:\Projects\Docs\aboutpage.md", result);
+        }
+
+        [TestMethod]
+        public void FindMarkdownFileForHtmlPath_HtmlExtension_FindsMarkdownFile()
+        {
+            string filePath = @"C:\Projects\Docs\aboutpage.html";
+            bool fileExists(string path) => path == @"C:\Projects\Docs\aboutpage.markdown";
+
+            string result = Browser.FindMarkdownFileForHtmlPath(filePath, fileExists);
+
+            Assert.AreEqual(@"C:\Projects\Docs\aboutpage.markdown", result);
+        }
+
+        [TestMethod]
+        public void FindMarkdownFileForHtmlPath_UppercaseHtmlExtension_CaseInsensitive()
+        {
+            string filePath = @"C:\Projects\Docs\aboutpage.HTML";
+            bool fileExists(string path) => path == @"C:\Projects\Docs\aboutpage.md";
+
+            string result = Browser.FindMarkdownFileForHtmlPath(filePath, fileExists);
+
+            Assert.AreEqual(@"C:\Projects\Docs\aboutpage.md", result);
+        }
+
+        [TestMethod]
+        public void FindMarkdownFileForHtmlPath_HtmlExtension_NoMarkdownFound_ReturnsNull()
+        {
+            string filePath = @"C:\Projects\Docs\aboutpage.html";
+            bool fileExists(string path) => false;
+
+            string result = Browser.FindMarkdownFileForHtmlPath(filePath, fileExists);
+
+            Assert.IsNull(result);
+        }
+
+        [TestMethod]
+        public void FindMarkdownFileForHtmlPath_NonHtmlExtension_ReturnsNull()
+        {
+            string filePath = @"C:\Projects\Docs\aboutpage.txt";
+            bool fileExists(string path) => true;
+
+            string result = Browser.FindMarkdownFileForHtmlPath(filePath, fileExists);
+
+            Assert.IsNull(result);
+        }
+
+        [TestMethod]
+        public void FindMarkdownFileForHtmlPath_MarkdownExtension_ReturnsNull()
+        {
+            string filePath = @"C:\Projects\Docs\aboutpage.md";
+            bool fileExists(string path) => true;
+
+            string result = Browser.FindMarkdownFileForHtmlPath(filePath, fileExists);
+
+            Assert.IsNull(result);
+        }
+
+        [TestMethod]
+        public void FindMarkdownFileForHtmlPath_HtmlExtension_PrioritizesMdOverMarkdown()
+        {
+            string filePath = @"C:\Projects\Docs\aboutpage.html";
+            bool fileExists(string path) =>
+                path == @"C:\Projects\Docs\aboutpage.md" ||
+                path == @"C:\Projects\Docs\aboutpage.markdown";
+
+            string result = Browser.FindMarkdownFileForHtmlPath(filePath, fileExists);
+
+            Assert.AreEqual(@"C:\Projects\Docs\aboutpage.md", result);
+        }
+
+        #endregion
+
         #region Fragment Extraction Tests
 
         /// <summary>
