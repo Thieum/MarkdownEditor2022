@@ -17,7 +17,6 @@ namespace MarkdownEditor2022
         private readonly Document _document;
         private readonly ITextView _textView;
         private readonly string _marginName;
-        private double _lastScrollPosition;
         private bool _isDisposed;
         private DateTime _lastEdit;
         private readonly Debouncer _debouncer = new(150); // Per-instance debouncer for correct behavior with multiple documents
@@ -480,13 +479,14 @@ namespace MarkdownEditor2022
                 return;
             }
 
-            // Only update if the view was actually scrolled and enough time has passed since last edit
-            if (_lastEdit < DateTime.Now.AddMilliseconds(-500) && Math.Abs(_lastScrollPosition - e.NewViewState.ViewportTop) > 1.0)
+            // Compare this layout's states, not a position left over from a suppressed event.
+            if (_lastEdit < DateTime.Now.AddMilliseconds(-500) &&
+                Math.Abs(e.OldViewState.ViewportTop - e.NewViewState.ViewportTop) > 1.0 &&
+                !Browser._browser.IsMouseOver && !Browser._browser.IsKeyboardFocusWithin)
             {
-                _lastScrollPosition = e.NewViewState.ViewportTop;
                 int firstLine = _textView.TextSnapshot.GetLineNumberFromPosition(_textView.TextViewLines.FirstVisibleLine.Start.Position);
 
-                Browser.UpdatePositionAsync(firstLine, false).FireAndForget();
+                Browser.UpdatePositionAsync(firstLine, false, fromEditor: true).FireAndForget();
             }
         }
 
@@ -514,7 +514,7 @@ namespace MarkdownEditor2022
 
             // Making sure the line being edited is visible in the preview window
             int line = Math.Max(_textView.TextSnapshot.GetLineNumberFromPosition(_textView.Caret.Position.BufferPosition) - 5, 0);
-            Browser.UpdatePositionAsync(line, true).FireAndForget();
+            Browser.UpdatePositionAsync(line, true, fromEditor: true).FireAndForget();
         }
 
         public ITextViewMargin GetTextViewMargin(string marginName)

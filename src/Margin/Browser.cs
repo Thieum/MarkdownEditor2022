@@ -35,6 +35,8 @@ namespace MarkdownEditor2022
         private readonly Document _document;
         private readonly IWpfTextView _textView;
         private readonly IEditorFormatMapService _formatMapService;
+        private readonly PreviewScrollSync _scrollSync = new();
+        private bool _isDisposed;
         private int _currentViewLine;
         private double _cachedPosition = 0,
                        _cachedHeight = 0,
@@ -475,6 +477,7 @@ namespace MarkdownEditor2022
 
         public void Dispose()
         {
+            _isDisposed = true;
             VSColorTheme.ThemeChanged -= OnThemeChanged;
             _browser.Initialized -= BrowserInitialized;
             _browser.NavigationStarting -= BrowserNavigationStarting;
@@ -1111,49 +1114,60 @@ namespace MarkdownEditor2022
             await _browser.ExecuteScriptAsync(script.Replace("\r", "\\r").Replace("\n", "\\n"));
         }
 
-        public Task UpdatePositionAsync(int line, bool isTyping)
+        public Task UpdatePositionAsync(int line, bool isTyping, bool fromEditor = false)
         {
-            // Suppress scroll sync when the preview was recently scrolled programmatically
-            // (prevents feedback loop) or after a click-to-navigate action
-            return IsScrollSyncSuppressed
-                ? Task.CompletedTask
-                : _currentViewLine == line
-                ? Task.CompletedTask
-                : ThreadHelper.JoinableTaskFactory.StartOnIdle(async () =>
+            if (_isDisposed || IsScrollSyncSuppressed)
+            {
+                return Task.CompletedTask;
+            }
+
+            int version = _scrollSync.RequestSync(fromEditor);
+            return ThreadHelper.JoinableTaskFactory.StartOnIdle(async () =>
+            {
+                // Input and newer editor requests can arrive while this work waits for idle.
+                if (_isDisposed || IsScrollSyncSuppressed || !_scrollSync.CanApply(version))
                 {
-                    _currentViewLine = _document.Markdown.FindClosestLine(line);
-                    await SyncNavigationAsync(isTyping);
-                }, VsTaskRunContext.UIThreadIdlePriority).Task;
+                    return;
+                }
+
+                int targetLine = _document.Markdown.FindClosestLine(line);
+                if (_currentViewLine != targetLine)
+                {
+                    _currentViewLine = targetLine;
+                    await SyncNavigationAsync(isTyping, version);
+                }
+            }, VsTaskRunContext.UIThreadIdlePriority).Task;
         }
 
-        private async Task SyncNavigationAsync(bool isTyping)
+        private async Task SyncNavigationAsync(bool isTyping, int? requestVersion = null)
         {
-            if (await IsHtmlTemplateLoadedAsync())
+            int version = requestVersion ?? _scrollSync.Version;
+            bool isTemplateLoaded = await IsHtmlTemplateLoadedAsync();
+            if (_isDisposed || IsScrollSyncSuppressed || !_scrollSync.CanApply(version))
             {
-                if (_currentViewLine == 0)
-                {
-                    // Forces the preview window to scroll to the top of the document
-                    await _browser.ExecuteScriptAsync("document.documentElement.scrollTop=0;");
-                    _lastPreviewScrollTime = DateTime.UtcNow;
-                }
-                else
-                {
-                    // When typing, scroll the edited element into view a bit under the top...
-                    if (isTyping)
-                    {
-                        //string scrollScript = @$"
-                        //    let element = document.getElementById('pragma-line-{_currentViewLine}');
-                        //    let docElm = document.documentElement;
-                        //    // Do not scroll if element is already on screen
-                        //    if (element.offsetTop < scrollPos || element.offsetTop > scrollPos + windowHeight) return;
+                return;
+            }
 
-                        //    document.documentElement.scrollTop = element.offsetTop - 200;
-                        //    ";
-                        //await _browser.ExecuteScriptAsync(scrollScript);
-                    }
-                    else
+            if (isTemplateLoaded)
+            {
+                if (_currentViewLine == 0 || !isTyping)
+                {
+                    // Recheck in the renderer as input may precede delivery of its WebMessage.
+                    string inputToken = EscapeForJavaScript(_scrollSync.InputToken);
+                    string script = $@"(function() {{
+                        if (window.__previewScrollInput && window.__previewScrollInput !== ""{inputToken}"") return false;
+                        if ({_currentViewLine} === 0) {{
+                            document.documentElement.scrollTop = 0;
+                        }} else {{
+                            var element = document.getElementById('pragma-line-{_currentViewLine}');
+                            if (!element) return false;
+                            element.scrollIntoView(true);
+                        }}
+                        return true;
+                    }})();";
+                    string result = await _browser.ExecuteScriptAsync(script);
+                    if (result == "true")
                     {
-                        await _browser.ExecuteScriptAsync($@"document.getElementById(""pragma-line-{_currentViewLine}"").scrollIntoView(true);");
                         _lastPreviewScrollTime = DateTime.UtcNow;
                     }
                 }
@@ -1663,6 +1677,7 @@ namespace MarkdownEditor2022
         [content]
     </div>
     [scripts]
+    [scrollinputscript]
     [clicksyncscript]
     ";
                 string clickSyncScript = AdvancedOptions.Instance.EnablePreviewClickSync ? GetClickToSyncScript() : string.Empty;
@@ -1672,6 +1687,7 @@ namespace MarkdownEditor2022
                     .Replace("[content]", defaultContent)
                     .Replace("[title]", "Markdown Preview")
                     .Replace("<body>", $"<body{bodyStyle}>")
+                    .Replace("[scrollinputscript]", PreviewScrollSync.InputScript)
                     .Replace("[clicksyncscript]", clickSyncScript);
                 _templateCache[cacheKey] = processed;
                 cachedTemplate = processed;
@@ -2084,6 +2100,13 @@ namespace MarkdownEditor2022
                 string message = e.TryGetWebMessageAsString();
                 if (string.IsNullOrEmpty(message))
                 {
+                    return;
+                }
+
+                if (message.StartsWith("previewInput:", StringComparison.Ordinal))
+                {
+                    _scrollSync.OnPreviewInteraction(message.Substring("previewInput:".Length));
+                    _currentViewLine = -1;
                     return;
                 }
 
