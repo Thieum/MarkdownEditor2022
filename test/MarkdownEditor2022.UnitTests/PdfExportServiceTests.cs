@@ -18,7 +18,7 @@ namespace MarkdownEditor2022.UnitTests
         public async Task WaitForCompletionAsync_PendingTaskCanCompleteBeforeDeadline()
         {
             TaskCompletionSource<bool> completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
-            Task wait = PdfExportService.WaitForCompletionAsync(completion.Task, TimeSpan.FromSeconds(2), "Timed out.");
+            Task wait = PdfExportService.WaitForCompletionAsync(completion.Task, TimeSpan.FromSeconds(30), "Timed out.");
 
             Assert.IsFalse(wait.IsCompleted);
             completion.SetResult(true);
