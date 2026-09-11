@@ -14,7 +14,7 @@ or get the [CI build][vsixgallery].
 
 This extension delivers a full featured Markdown editor with live preview, syntax-aware editing, and turnkey workflows for GitHub flavored Markdown.
 
-> **💡 Tip:** For the best experience, pair this extension with [Markdown Lint](https://marketplace.visualstudio.com/items?itemName=MadsKristensen.MarkdownLint) for linting/validation and [Image Optimizer](https://marketplace.visualstudio.com/items?itemName=MadsKristensen.ImageOptimizer64bit) for automatic image compression.
+> **💡 Recommended pairing:** Use Markdown Editor v2 for syntax-aware editing, live preview, navigation, and Markdown workflows. Pair it with [Markdown Lint](https://marketplace.visualstudio.com/items?itemName=MadsKristensen.MarkdownLint) for validation, diagnostics, and automatic fixes. The two extensions are designed to work together.
 
 ## Getting Started
 
