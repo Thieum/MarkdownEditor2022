@@ -31,6 +31,32 @@ jobs:
     - name: Setup MSBuild
       uses: microsoft/setup-msbuild@v3
 
+    - name: Setup Node for preview tests
+      uses: actions/setup-node@v7
+      with:
+        node-version: '22'
+
+    - name: Ensure WebView2 Runtime for integration tests
+      shell: pwsh
+      run: |
+        $runtimeKeys = @(
+          'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}',
+          'HKCU:\Software\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
+        )
+        foreach ($key in $runtimeKeys) {
+          if (Test-Path $key) {
+            $version = (Get-Item $key).GetValue('pv')
+            if ($version -and [version]$version -gt [version]'0.0.0.0') {
+              Write-Host "WebView2 Runtime $version is already installed."
+              return
+            }
+          }
+        }
+        $installer = Join-Path $env:RUNNER_TEMP 'MicrosoftEdgeWebview2Setup.exe'
+        Invoke-WebRequest 'https://go.microsoft.com/fwlink/p/?LinkId=2124703' -OutFile $installer
+        $process = Start-Process $installer -ArgumentList '/silent', '/install' -Wait -PassThru
+        if ($process.ExitCode -ne 0) { throw "WebView2 installation failed with exit code $($process.ExitCode)." }
+
     - name: Cache NuGet packages
       uses: actions/cache@v5
       with:

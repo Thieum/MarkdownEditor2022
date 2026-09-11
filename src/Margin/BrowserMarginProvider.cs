@@ -34,19 +34,7 @@ namespace MarkdownEditor2022
 
         internal static BrowserMargin CreateMarginCore(IWpfTextViewHost host, IEditorFormatMapService formatMapService, string marginName)
         {
-            BrowserMargin margin = new(host.TextView, formatMapService, marginName);
-
-            void OnSaved(AdvancedOptions options) => margin.RefreshAsync().FireAndForget();
-            AdvancedOptions.Saved += OnSaved;
-
-            void OnClosed(object sender, EventArgs e)
-            {
-                host.Closed -= OnClosed;
-                AdvancedOptions.Saved -= OnSaved;
-            }
-            host.Closed += OnClosed;
-
-            return margin;
+            return new BrowserMargin(host.TextView, formatMapService, marginName);
         }
     }
 

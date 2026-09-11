@@ -516,3 +516,32 @@ Should you encounter bugs or if you have feature requests, head on over to the [
 Pull requests are also very welcome, since I can't always get around to fixing all bugs myself. This is a personal passion project, so my time is limited.
 
 Another way to help out is to [sponsor me on GitHub](https://github.com/sponsors/madskristensen).
+
+### Running tests
+
+Build the solution on Windows using Visual Studio with the extension development tools
+and .NET Framework 4.8 targeting pack installed. Tests also require Node.js 22 or newer
+on `PATH` and the Microsoft Edge WebView2 Evergreen Runtime.
+
+Run the tests from Test Explorer, or from the repository root after building:
+
+```powershell
+dotnet test test\MarkdownEditor2022.UnitTests\MarkdownEditor2022.UnitTests.csproj -c Debug --no-build
+```
+
+The normal MSTest run also executes `test\preview-content-script.test.cjs` through
+`node --test`; no npm install is needed. These behavioral tests use the production
+`src\Margin\preview-content.js` asset. Real WebView2 tests exercise the same script
+with the bundled Prism, Mermaid, and MathJax libraries, covering lazy startup,
+unchanged-node reuse, superseded updates/undo, and MathJax cleanup. Each browser
+test uses an isolated profile and disposes its browser before removing that profile.
+Missing prerequisites fail the tests rather than silently skipping them. CI provisions
+Node.js and WebView2 and runs these tests through the same `dotnet test` command.
+
+Browser test output includes render timings and retained MathItem counts. Timings
+include browser IPC and test polling, not Visual Studio typing-to-paint latency.
+These tests do not replace profiling the installed extension during a long editing
+session: verify colorization while typing, edits and undo in a large mixed-content
+document, and retained managed/native memory after repeatedly opening and closing
+editors. DOM reuse currently matches exact block markup, so changes to line-marker
+IDs can recreate otherwise unchanged blocks.

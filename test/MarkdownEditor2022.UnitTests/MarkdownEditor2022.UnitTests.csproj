@@ -20,5 +20,13 @@
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\src\MarkdownEditor2022.csproj" />
+    <Reference Include="PresentationCore" />
+    <Reference Include="PresentationFramework" />
+    <Reference Include="WindowsBase" />
+  </ItemGroup>
+  <ItemGroup>
+    <Content Include="..\preview-content-script.test.cjs" Link="preview-content-script.test.cjs" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\src\Margin\preview-content.js;..\..\src\Margin\prism.js;..\..\src\Margin\mermaid.min.js;..\..\src\Margin\mathjax.js;..\..\src\Margin\color.js"
+             Link="Margin\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

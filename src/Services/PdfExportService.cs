@@ -1,5 +1,7 @@
+using System.Diagnostics;
 using System.IO;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using Microsoft.Web.WebView2.Core;
@@ -27,24 +29,28 @@ namespace MarkdownEditor2022.Services
 
             string tempHtmlFile = null;
             Window hiddenWindow = null;
+            WebView2 webView = null;
 
             try
             {
-                // Build the HTML document from the markdown file
-                string html = HtmlGenerationService.BuildHtmlDocument(markdownFile);
-                html = AddRenderingAssets(html);
+                await Task.Run(() =>
+                {
+                    string html = AddRenderingAssets(HtmlGenerationService.BuildHtmlDocument(markdownFile));
 
-                // Write the HTML next to the markdown file
-                // resources (images, stylesheets, …) correctly via the same base directory.
-                string markdownDir = Path.GetDirectoryName(markdownFile);
-                tempHtmlFile = Path.Combine(markdownDir, $".export-{Guid.NewGuid():N}.html");
-                File.WriteAllText(tempHtmlFile, html, new System.Text.UTF8Encoding(true));
+                    // Keep relative resources rooted next to the markdown file.
+                    string markdownDir = Path.GetDirectoryName(markdownFile);
+                    tempHtmlFile = Path.Combine(markdownDir, $".export-{Guid.NewGuid():N}.html");
+                    File.WriteAllText(tempHtmlFile, html, new UTF8Encoding(true));
+                });
 
                 // All WebView2 interaction must happen on the UI thread
                 await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
 
                 Browser.EnsureNativeDllSearchPath();
-                CoreWebView2Environment environment = await Browser.GetOrCreateWebView2EnvironmentAsync();
+                Task<CoreWebView2Environment> environmentTask = Browser.GetOrCreateWebView2EnvironmentAsync();
+                await WaitForCompletionAsync(environmentTask, TimeSpan.FromSeconds(30),
+                    "Timed out initializing the browser environment for PDF export.");
+                CoreWebView2Environment environment = await environmentTask;
 
                 // Create an off-screen 1×1 window — needed because WebView2 requires a visual tree
                 hiddenWindow = new Window
@@ -60,28 +66,39 @@ namespace MarkdownEditor2022.Services
                     Opacity = 0
                 };
 
-                WebView2 webView = new WebView2();
+                webView = new WebView2();
                 hiddenWindow.Content = webView;
                 hiddenWindow.Show();
 
-                await webView.EnsureCoreWebView2Async(environment);
+                await WaitForCompletionAsync(webView.EnsureCoreWebView2Async(environment), TimeSpan.FromSeconds(30),
+                    "Timed out initializing the browser for PDF export.");
 
                 // Navigate to the temp HTML file and wait for navigation to complete
-                TaskCompletionSource<bool> navigationCompleted = new TaskCompletionSource<bool>();
+                TaskCompletionSource<CoreWebView2NavigationCompletedEventArgs> navigationCompleted =
+                    new(TaskCreationOptions.RunContinuationsAsynchronously);
 
                 void OnNavigationCompleted(object s, CoreWebView2NavigationCompletedEventArgs e)
                 {
-                    webView.NavigationCompleted -= OnNavigationCompleted;
-                    navigationCompleted.TrySetResult(e.IsSuccess);
+                    navigationCompleted.TrySetResult(e);
                 }
 
-                webView.NavigationCompleted += OnNavigationCompleted;
-                webView.CoreWebView2.Navigate(new Uri(tempHtmlFile).AbsoluteUri);
-
-                bool navSuccess = await navigationCompleted.Task;
-                if (!navSuccess)
+                try
                 {
-                    throw new InvalidOperationException("Failed to load the HTML content for PDF export.");
+                    webView.NavigationCompleted += OnNavigationCompleted;
+                    webView.CoreWebView2.Navigate(new Uri(tempHtmlFile).AbsoluteUri);
+
+                    await WaitForCompletionAsync(navigationCompleted.Task, TimeSpan.FromSeconds(30),
+                        "Timed out loading the HTML content for PDF export.");
+                    CoreWebView2NavigationCompletedEventArgs navigation = await navigationCompleted.Task;
+                    if (!navigation.IsSuccess)
+                    {
+                        throw new InvalidOperationException(
+                            $"Failed to load the HTML content for PDF export: {navigation.WebErrorStatus}.");
+                    }
+                }
+                finally
+                {
+                    webView.NavigationCompleted -= OnNavigationCompleted;
                 }
 
                 await WaitForRenderingAsync(webView.CoreWebView2);
@@ -89,7 +106,10 @@ namespace MarkdownEditor2022.Services
                 CoreWebView2PrintSettings printSettings = webView.CoreWebView2.Environment.CreatePrintSettings();
                 printSettings.ShouldPrintBackgrounds = true;
                 printSettings.ShouldPrintHeaderAndFooter = false;
-                bool printSuccess = await webView.CoreWebView2.PrintToPdfAsync(outputPdfPath, printSettings);
+                Task<bool> printTask = webView.CoreWebView2.PrintToPdfAsync(outputPdfPath, printSettings);
+                await WaitForCompletionAsync(printTask, TimeSpan.FromMinutes(2),
+                    $"Timed out writing the PDF export to: {outputPdfPath}");
+                bool printSuccess = await printTask;
                 if (!printSuccess)
                 {
                     throw new InvalidOperationException($"PDF export failed. The browser could not write to: {outputPdfPath}");
@@ -97,12 +117,48 @@ namespace MarkdownEditor2022.Services
             }
             finally
             {
-                await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
-                hiddenWindow?.Close();
-
-                if (tempHtmlFile != null && File.Exists(tempHtmlFile))
+                try
                 {
-                    try { File.Delete(tempHtmlFile); } catch { /* best-effort cleanup */ }
+                    await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
+                    try
+                    {
+                        webView?.Dispose();
+                    }
+                    finally
+                    {
+                        hiddenWindow?.Close();
+                    }
+                }
+                finally
+                {
+                    if (tempHtmlFile != null)
+                    {
+                        await Task.Run(() =>
+                        {
+                            try { File.Delete(tempHtmlFile); }
+                            catch (IOException ex) { ex.Log(); }
+                            catch (UnauthorizedAccessException ex) { ex.Log(); }
+                        });
+                    }
+                }
+            }
+        }
+
+        internal static async Task WaitForCompletionAsync(Task task, TimeSpan timeout, string timeoutMessage)
+        {
+            using (CancellationTokenSource cancellation = new(timeout))
+            {
+                try
+                {
+                    await task.WithCancellationAsync(cancellation.Token);
+                }
+                catch (OperationCanceledException ex) when (cancellation.IsCancellationRequested)
+                {
+                    // WebView2 operations cannot be canceled. Observe faults arriving after disposal.
+                    _ = task.ContinueWith(completed => { _ = completed.Exception; },
+                        CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+                        TaskScheduler.Default);
+                    throw new TimeoutException(timeoutMessage, ex);
                 }
             }
         }
@@ -136,10 +192,20 @@ namespace MarkdownEditor2022.Services
 
         private static async Task WaitForRenderingAsync(CoreWebView2 webView)
         {
+            Stopwatch elapsed = Stopwatch.StartNew();
             for (int i = 0; i < 100; i++)
             {
-                string ready = await webView.ExecuteScriptAsync(
+                TimeSpan remaining = TimeSpan.FromSeconds(10) - elapsed.Elapsed;
+                if (remaining <= TimeSpan.Zero)
+                {
+                    break;
+                }
+
+                Task<string> readyTask = webView.ExecuteScriptAsync(
                     "document.readyState === 'complete' && window.__markdownEditorReady === true");
+                await WaitForCompletionAsync(readyTask, remaining,
+                    "Timed out waiting for PDF preview rendering to complete.");
+                string ready = await readyTask;
                 if (string.Equals(ready, "true", StringComparison.OrdinalIgnoreCase))
                 {
                     return;

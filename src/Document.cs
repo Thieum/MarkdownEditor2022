@@ -15,16 +15,12 @@ namespace MarkdownEditor2022
     public class Document : IDisposable
     {
         private readonly ITextBuffer _buffer;
-        private readonly SemaphoreSlim _parseSemaphore = new(1, 1);
-        private CancellationTokenSource _parseCts = new();
-        private readonly CancellationTokenSource _disposalTokenSource = new();
+        private readonly ParseScheduler _parseScheduler;
         private readonly TaskCompletionSource<bool> _initialParseCompletionSource = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        private readonly object _parseCancellationLock = new();
-        private int _parseRequestVersion;
-        private int _parseWorkerRunning;
-        private bool _isDisposed;
-        private string _lastParsedText;
-        private int _lastParsedVersion;
+        private readonly object _publicationLock = new();
+        private volatile bool _isDisposed;
+        private int _lastParsedVersion = -1;
+        private ITextSnapshot _parsedSnapshot;
 
         public static MarkdownPipeline Pipeline { get; } = new MarkdownPipelineBuilder()
             .UseAutoIdentifiers(AutoIdentifierOptions.GitHub)  // Must be BEFORE UseAdvancedExtensions to override default
@@ -57,11 +53,13 @@ namespace MarkdownEditor2022
         public Document(ITextBuffer buffer)
         {
             _buffer = buffer;
+            // Classification needs each edit promptly; only preview rendering should wait for a typing pause.
+            _parseScheduler = new ParseScheduler(ParseAsync);
             _buffer.Changed += BufferChanged;
             FileName = buffer.GetFileName();
 
-            RequestParse();
             AdvancedOptions.Saved += AdvancedOptionsSaved;
+            RequestParse();
         }
 
         public MarkdownDocument Markdown { get; private set; }
@@ -72,16 +70,20 @@ namespace MarkdownEditor2022
 
         public DocumentAnalysis Analysis { get; private set; }
 
+        internal DocumentAnalysis GetAnalysis(out ITextSnapshot snapshot)
+        {
+            lock (_publicationLock)
+            {
+                snapshot = _parsedSnapshot;
+                return Analysis;
+            }
+        }
+
         /// <summary>
         /// Waits for the initial parse to complete. Returns immediately if already parsed.
         /// </summary>
         public Task WaitForInitialParseAsync(CancellationToken cancellationToken = default)
         {
-            if (Markdown != null)
-            {
-                return Task.CompletedTask;
-            }
-
             return _initialParseCompletionSource.Task.WithCancellation(cancellationToken);
         }
 
@@ -92,182 +94,82 @@ namespace MarkdownEditor2022
 
         private void RequestParse()
         {
-            Interlocked.Increment(ref _parseRequestVersion);
-
-            if (Interlocked.Exchange(ref _parseWorkerRunning, 1) == 0)
-            {
-                ParseLoopAsync().FireAndForget();
-            }
+            _parseScheduler.Request();
         }
 
-        private async Task ParseLoopAsync()
-        {
-            int observedRequestVersion = 0;
-
-            try
-            {
-                while (!_isDisposed)
-                {
-                    observedRequestVersion = Volatile.Read(ref _parseRequestVersion);
-                    await ParseAsync();
-
-                    if (observedRequestVersion == Volatile.Read(ref _parseRequestVersion))
-                    {
-                        break;
-                    }
-                }
-            }
-            finally
-            {
-                Interlocked.Exchange(ref _parseWorkerRunning, 0);
-
-                if (!_isDisposed && observedRequestVersion != Volatile.Read(ref _parseRequestVersion) &&
-                    Interlocked.Exchange(ref _parseWorkerRunning, 1) == 0)
-                {
-                    ParseLoopAsync().FireAndForget();
-                }
-            }
-        }
-
-        private async Task ParseAsync()
+        private async Task ParseAsync(CancellationToken cancellationToken)
         {
             if (_isDisposed)
             {
                 return;
             }
 
-            // Cancel any in-flight parse (we will ignore its result if already running).
-            // Keep cancelled sources undisposed until their parse has exited to avoid racing
-            // token access during rapid edits or disposal.
-            CancellationTokenSource localCts;
-            CancellationToken localToken;
-            lock (_parseCancellationLock)
+            bool success = false;
+            bool failed = false;
+            IsParsing = true;
+            try
             {
-                if (_isDisposed)
+                cancellationToken.ThrowIfCancellationRequested();
+                ITextSnapshot snapshot = _buffer.CurrentSnapshot;
+                int snapshotVersion = snapshot.Version.VersionNumber;
+
+                // Settings still need a Parsed notification, but not another full-text allocation.
+                if (snapshotVersion == _lastParsedVersion)
                 {
+                    success = true;
                     return;
                 }
 
-                _parseCts?.Cancel();
-                localCts = new CancellationTokenSource();
-                _parseCts = localCts;
-                localToken = localCts.Token;
-            }
+                string text = snapshot.GetText();
 
-            // Use semaphore to prevent multiple concurrent parsing operations.
-            // Always wait for the semaphore so parse requests are queued instead of dropped,
-            // which can otherwise leave initial parsing incomplete.
-            try
-            {
-                using CancellationTokenSource waitCts = CancellationTokenSource.CreateLinkedTokenSource(
-                    _disposalTokenSource.Token,
-                    localToken);
-                await _parseSemaphore.WaitAsync(waitCts.Token);
-            }
-            catch (OperationCanceledException)
-            {
-                ReleaseParseCancellationSource(localCts);
-                return;
-            }
+                // This fixes this bug: https://github.com/madskristensen/MarkdownEditor2022/issues/128
+                // Also supports ::: mermaid syntax (with space): https://github.com/madskristensen/MarkdownEditor2022/issues/170
+                text = _colonFixRegex.Replace(text, ColonFixEvaluator);
+                MarkdownDocument md = Markdig.Markdown.Parse(text, Pipeline);
 
-            bool semaphoreAcquired = false;
-
-            try
-            {
-                semaphoreAcquired = true;
-                IsParsing = true;
-                bool success = false;
-
-                try
+                if (cancellationToken.IsCancellationRequested ||
+                    _buffer.CurrentSnapshot.Version.VersionNumber != snapshotVersion)
                 {
-                    await TaskScheduler.Default; // move to a background thread
+                    return; // Do not build analysis for an already obsolete parse.
+                }
 
-                    if (localToken.IsCancellationRequested)
+                DocumentAnalysis analysis = BuildAnalysis(md);
+
+                lock (_publicationLock)
+                {
+                    if (_isDisposed || _buffer.CurrentSnapshot.Version.VersionNumber != snapshotVersion)
                     {
                         return;
-                    }
-
-                    // Capture the snapshot and its version after switching threads so the
-                    // version corresponds to the exact text being parsed.
-                    ITextSnapshot snapshot = _buffer.CurrentSnapshot;
-                    int snapshotVersion = snapshot.Version.VersionNumber;
-                    string text = snapshot.GetText();
-
-                    // Skip parsing if text hasn't changed based on snapshot version & content
-                    if (snapshotVersion == _lastParsedVersion && string.Equals(text, _lastParsedText, System.StringComparison.Ordinal))
-                    {
-                        success = true; // treat as success so consumers can continue
-                        return;
-                    }
-
-                    // This fixes this bug: https://github.com/madskristensen/MarkdownEditor2022/issues/128
-                    // Also supports ::: mermaid syntax (with space): https://github.com/madskristensen/MarkdownEditor2022/issues/170
-                    text = _colonFixRegex.Replace(text, ColonFixEvaluator);
-
-                    MarkdownDocument md = Markdig.Markdown.Parse(text, Pipeline);
-
-                    if (localToken.IsCancellationRequested)
-                    {
-                        return; // abandon
-                    }
-
-                    // Build analysis (single pass over descendants)
-                    DocumentAnalysis analysis = BuildAnalysis(md);
-
-                    // Only publish results if the snapshot hasn't advanced further
-                    if (_buffer.CurrentSnapshot.Version.VersionNumber != snapshotVersion)
-                    {
-                        return; // stale result
                     }
 
                     Markdown = md;
                     Analysis = analysis;
-                    _lastParsedText = text;
+                    _parsedSnapshot = snapshot;
                     _lastParsedVersion = snapshotVersion;
                     success = true;
                 }
-                catch (Exception ex)
-                {
-                    await ex.LogAsync();
-                }
-                finally
-                {
-                    IsParsing = false;
-
-                    if (!localToken.IsCancellationRequested)
-                    {
-                        // Complete the initial wait even when parsing fails; consumers can inspect Markdown.
-                        _initialParseCompletionSource.TrySetResult(true);
-
-                        if (success)
-                        {
-                            Parsed?.Invoke(this);
-                        }
-                    }
-                }
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+            }
+            catch (Exception ex)
+            {
+                failed = true;
+                await ex.LogAsync();
             }
             finally
             {
-                if (semaphoreAcquired)
+                IsParsing = false;
+                if (!_isDisposed && (success || failed))
                 {
-                    _parseSemaphore.Release();
-                }
-
-                ReleaseParseCancellationSource(localCts);
-            }
-        }
-
-        private void ReleaseParseCancellationSource(CancellationTokenSource localCts)
-        {
-            lock (_parseCancellationLock)
-            {
-                if (ReferenceEquals(_parseCts, localCts))
-                {
-                    _parseCts = null;
+                    // A stale result is not usable: keep the initial wait pending for its replacement.
+                    _initialParseCompletionSource.TrySetResult(true);
+                    if (success)
+                    {
+                        Parsed?.Invoke(this);
+                    }
                 }
             }
-
-            localCts.Dispose();
         }
 
         private static DocumentAnalysis BuildAnalysis(MarkdownDocument md)
@@ -320,7 +222,7 @@ namespace MarkdownEditor2022
 
         public void Dispose()
         {
-            lock (_parseCancellationLock)
+            lock (_publicationLock)
             {
                 if (_isDisposed)
                 {
@@ -328,14 +230,11 @@ namespace MarkdownEditor2022
                 }
 
                 _isDisposed = true;
-                _parseCts?.Cancel();
             }
 
             _buffer.Changed -= BufferChanged;
             AdvancedOptions.Saved -= AdvancedOptionsSaved;
-            _disposalTokenSource.Cancel();
-            // The source may still be observed by an in-flight WaitAsync continuation.
-            // Let it be reclaimed with the document instead of disposing it during teardown.
+            _parseScheduler.Dispose();
             _initialParseCompletionSource.TrySetCanceled();
         }
 

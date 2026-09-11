@@ -106,6 +106,9 @@
     <Content Include="Margin\prism.js">
       <IncludeInVSIX>true</IncludeInVSIX>
     </Content>
+    <Content Include="Margin\preview-content.js">
+      <IncludeInVSIX>true</IncludeInVSIX>
+    </Content>
     <Content Include="Registry.pkgdef">
       <IncludeInVSIX>true</IncludeInVSIX>
     </Content>

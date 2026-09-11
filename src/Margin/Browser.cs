@@ -21,6 +21,7 @@ using Microsoft.VisualStudio.PlatformUI;
 using Microsoft.VisualStudio.Text;
 using Microsoft.VisualStudio.Text.Classification;
 using Microsoft.VisualStudio.Text.Editor;
+using Microsoft.VisualStudio.Threading;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.Wpf;
 using HorizontalAlignment = System.Windows.HorizontalAlignment;
@@ -41,7 +42,14 @@ namespace MarkdownEditor2022
         private int _currentViewLine;
         private int _updateVersion;
         private readonly object _updateCancellationLock = new();
-        private CancellationTokenSource _updateCancellation = new();
+        private CancellationTokenSource _updateCancellation;
+        private readonly SemaphoreSlim _updateGate = new(1, 1);
+        private bool _browserReady;
+        private bool _fullRefreshRequested = true;
+        private string _lastRenderedHtml;
+        private MarkdownDocument _lastRenderedMarkdown;
+        private string _resolvedRootSetting;
+        private bool _rootResolved;
         private double _cachedPosition = 0,
                        _cachedHeight = 0,
                        _positionPercentage = 0;
@@ -105,7 +113,7 @@ namespace MarkdownEditor2022
         private static readonly Regex _languageRegex = new("\"language-([^\"]+)\"", RegexOptions.Compiled | RegexOptions.CultureInvariant);
         private static readonly Regex _mermaidRegex = new("class=\"language-mermaid\"", RegexOptions.Compiled | RegexOptions.CultureInvariant);
         private static readonly Regex _escapeRegex = new(@"[\\\r\n""]", RegexOptions.Compiled | RegexOptions.CultureInvariant);
-        private static readonly ConcurrentDictionary<string, string> _templateCache = new();
+        private static readonly BoundedCache<string, (string version, string template)> _templateCache = new(32);
 
         // Regex for VS Code-style line-link fragments: #L10 or #L10,5 (also accepts L10:5).
         private static readonly Regex _lineLinkFragmentRegex = new(
@@ -440,13 +448,15 @@ namespace MarkdownEditor2022
         private static bool _staticResourcesPrewarmed;
         private static readonly object _prewarmLock = new();
 
-        // Pre-computed HTML template ready for content insertion (computed on first use per theme)
-        private readonly Task<string> _precomputedTemplateTask;
         private bool _isTemplateLoaded;
+        private TaskCompletionSource<bool> _navigationCompletion;
+        private ulong _navigationId;
+        private TaskCompletionSource<bool> _renderCompletion;
+        private int _renderRequestId;
 
         // Cache recursive file discovery to avoid repeated directory traversal on frequent preview refreshes
         private static readonly TimeSpan _fileDiscoveryCacheDuration = TimeSpan.FromSeconds(5);
-        private static readonly ConcurrentDictionary<string, (string path, DateTime expiresUtc)> _recursiveFileLookupCache = new();
+        private static readonly BoundedCache<string, (string path, DateTime expiresUtc)> _recursiveFileLookupCache = new(128);
 
         public Browser(string file, Document document, IWpfTextView textView, IEditorFormatMapService formatMapService)
         {
@@ -455,16 +465,6 @@ namespace MarkdownEditor2022
             _textView = textView;
             _formatMapService = formatMapService;
             _currentViewLine = -1;
-
-            // Start WebView2 environment creation immediately so it runs in parallel with WPF initialization
-            // This is a no-op if already cached from a previous instance
-            _ = GetOrCreateWebView2EnvironmentAsync();
-
-            // Pre-warm static resources (CSS files, default template) on first Browser instance
-            PrewarmStaticResources();
-
-            // Start template preparation in parallel with WebView2 init
-            _precomputedTemplateTask = Task.Run(GetHtmlTemplate);
 
             _browser.Initialized += BrowserInitialized;
             _browser.NavigationStarting += BrowserNavigationStarting;
@@ -496,8 +496,7 @@ namespace MarkdownEditor2022
                 updateCancellation?.Cancel();
             }
 
-            updateCancellation?.Dispose();
-            VSColorTheme.ThemeChanged -= OnThemeChanged;
+            // The update that owns this source disposes it after its continuation exits.
             _browser.Initialized -= BrowserInitialized;
             _browser.NavigationStarting -= BrowserNavigationStarting;
 
@@ -516,31 +515,17 @@ namespace MarkdownEditor2022
         public void InvalidateThemeCache()
         {
             _templateCache.Clear();
+            _recursiveFileLookupCache.Clear();
             _cachedThemeColors = null;
+            _rootResolved = false;
         }
 
-        private void OnThemeChanged(ThemeChangedEventArgs e)
+        internal void SuspendUpdates()
         {
-            // Clear template cache so new theme colors and CSS files are picked up
-            _templateCache.Clear();
-
-            // Invalidate per-instance theme color cache
-            _cachedThemeColors = null;
-
-            // Force full page reload to load new CSS (not just innerHTML update)
-            ThreadHelper.JoinableTaskFactory.RunAsync(async () =>
+            lock (_updateCancellationLock)
             {
-                await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
-
-                // Update the WebView2 default background color to match the new theme
-                if (_browser.CoreWebView2 != null)
-                {
-                    Color bgColor = GetPreviewBackgroundColor();
-                    _browser.DefaultBackgroundColor = System.Drawing.Color.FromArgb(bgColor.A, bgColor.R, bgColor.G, bgColor.B);
-                }
-
-                await ForceFullRefreshAsync();
-            }).FireAndForget();
+                _updateCancellation?.Cancel();
+            }
         }
 
         /// <summary>
@@ -548,192 +533,52 @@ namespace MarkdownEditor2022
         /// </summary>
         public async Task ForceFullRefreshAsync()
         {
-            try
-            {
-                await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
-
-                string html;
-
-                if (IsMermaidFile)
-                {
-                    // For standalone mermaid files, wrap the entire content in a mermaid div
-                    string content = _textView.TextBuffer.CurrentSnapshot.GetText();
-                    html = $"<pre class=\"mermaid\">{WebUtility.HtmlEncode(content)}</pre>";
-                }
-                else
-                {
-                    using CancellationTokenSource timeoutCts = new(TimeSpan.FromSeconds(10));
-                    await _document.WaitForInitialParseAsync(timeoutCts.Token);
-
-                    MarkdownDocument markdown = _document.Markdown;
-                    if (markdown == null)
-                    {
-                        return;
-                    }
-
-                    html = await RenderMarkdownToHtmlAsync(markdown);
-                }
-
-                // Feature detection
-                bool needsPrism = html.IndexOf("language-", StringComparison.OrdinalIgnoreCase) >= 0;
-                bool needsMermaid = html.IndexOf("class=\"mermaid\"", StringComparison.OrdinalIgnoreCase) >= 0 || html.IndexOf("language-mermaid", StringComparison.OrdinalIgnoreCase) >= 0;
-
-                // Always do full navigation to reload CSS
-                string htmlTemplate = GetHtmlTemplate();
-                string scripts = BuildInitialScriptTags(needsPrism, needsMermaid);
-                html = htmlTemplate.Replace("[content]", html).Replace("[scripts]", scripts);
-                _browser.NavigateToString(html);
-            }
-            catch (OperationCanceledException)
-            {
-                // Timeout - ignore
-            }
-            catch (Exception ex)
-            {
-                await ex.LogAsync();
-            }
+            await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
+            _fullRefreshRequested = true;
+            await UpdateBrowserAsync();
         }
 
         private void BrowserInitialized(object sender, EventArgs e)
         {
             ThreadHelper.JoinableTaskFactory.RunAsync(async () =>
             {
-                // Start WebView2 core initialization
-                Task webViewInitTask = InitializeWebView2CoreAsync();
-
-                // While WebView2 initializes, ensure template is ready (should already be computed from constructor)
-                Task<string> templateTask = _precomputedTemplateTask ?? Task.FromResult(GetHtmlTemplate());
-
-                // Wait for WebView2 to be ready
-                await webViewInitTask;
-                SetVirtualFolderMapping();
-
-                // Get pre-computed template (should be instant if precomputed in constructor)
-                string precomputedTemplate = await templateTask;
-
-                // Set the default background color to match the editor/tool window background
-                // This prevents white flash before content loads
-                Color bgColor = GetPreviewBackgroundColor();
-                _browser.DefaultBackgroundColor = System.Drawing.Color.FromArgb(bgColor.A, bgColor.R, bgColor.G, bgColor.B);
-
-                _browser.Visibility = Visibility.Visible;
-
-                // Render initial content using pre-computed template
-                await RenderInitialContentAsync(precomputedTemplate);
-            }).FireAndForget();
-
-            async Task InitializeWebView2CoreAsync()
-            {
-                CoreWebView2Environment webView2Environment = await GetOrCreateWebView2EnvironmentAsync();
-
-                await _browser.EnsureCoreWebView2Async(webView2Environment);
-
-                // Subscribe to messages from JavaScript for click-to-sync feature
-                _browser.CoreWebView2.WebMessageReceived += OnWebMessageReceived;
-                _browser.CoreWebView2.NavigationCompleted += OnNavigationCompleted;
-
-                // Listen for VS theme changes to update preview colors (deferred from constructor for faster startup)
-                VSColorTheme.ThemeChanged += OnThemeChanged;
-            }
-
-            void SetVirtualFolderMapping()
-            {
-                // Map markdown-editor-host for extension resources (CSS, JS for syntax highlighting, etc.)
-                string extensionFolder = GetFolder();
-                if (!string.IsNullOrWhiteSpace(_mappedMarkdownEditorVirtualHostName) &&
-                    !string.IsNullOrWhiteSpace(extensionFolder) &&
-                    Directory.Exists(extensionFolder))
-                {
-                    _browser.CoreWebView2.SetVirtualHostNameToFolderMapping(_mappedMarkdownEditorVirtualHostName, extensionFolder, CoreWebView2HostResourceAccessKind.Allow);
-                }
-
-                // Map only the permitted workspace/document root. This preserves ../ links within
-                // the workspace while preventing the preview from exposing the whole drive.
-                _previewRoot = GetPreviewRoot();
-                if (!string.IsNullOrWhiteSpace(_mappedBrowsingFileVirtualHostName) &&
-                    !string.IsNullOrWhiteSpace(_previewRoot) &&
-                    Directory.Exists(_previewRoot))
-                {
-                    _browser.CoreWebView2.SetVirtualHostNameToFolderMapping(_mappedBrowsingFileVirtualHostName, _previewRoot, CoreWebView2HostResourceAccessKind.Allow);
-                }
-            }
-
-            async Task RenderInitialContentAsync(string template)
-            {
                 try
                 {
-                    // Give an already-started parse a brief opportunity to complete, but do not
-                    // delay the first WebView navigation on parsing. The parser completion event
-                    // will replace the initial content as soon as the current snapshot is ready.
-                    using CancellationTokenSource timeoutCts = new(TimeSpan.FromMilliseconds(50));
-                    try
+                    CoreWebView2Environment environment = await GetOrCreateWebView2EnvironmentAsync();
+                    if (_isDisposed)
                     {
-                        if (_document.Markdown == null)
-                        {
-                            await _document.WaitForInitialParseAsync(timeoutCts.Token);
-                        }
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        // Parse is still running; render the available snapshot and refresh later.
+                        return;
                     }
 
-                    SetVirtualFolderMapping();
-                    MarkdownDocument markdown = _document.Markdown;
-                    string html = await RenderMarkdownToHtmlAsync(markdown);
-
-                    // Feature detection
-                    bool needsPrism = html.IndexOf("language-", StringComparison.OrdinalIgnoreCase) >= 0;
-                    bool needsMermaid = html.IndexOf("class=\"mermaid\"", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                        html.IndexOf("language-mermaid", StringComparison.OrdinalIgnoreCase) >= 0;
-                    bool needsMath = html.IndexOf("class=\"math\"", StringComparison.OrdinalIgnoreCase) >= 0;
-
-                    string scripts = BuildInitialScriptTags(needsPrism, needsMermaid, needsMath);
-                    string fullHtml = template.Replace("[content]", html).Replace("[scripts]", scripts);
-
-                    _isTemplateLoaded = false;
-                    _browser.NavigateToString(fullHtml);
-
-                    // Get initial height for scroll calculations
-                    string offsetHeightResult = await _browser.ExecuteScriptAsync("document.body.offsetHeight;");
-                    double.TryParse(offsetHeightResult, out _cachedHeight);
-
-                    if (_positionPercentage > 0)
+                    await _browser.EnsureCoreWebView2Async(environment);
+                    if (_isDisposed)
                     {
-                        await _browser.ExecuteScriptAsync($@"document.documentElement.scrollTop={_positionPercentage * _cachedHeight / 100}");
+                        return;
                     }
 
-                    await AdjustAnchorsAsync();
-
-                    // If parse wasn't ready, schedule a refresh once it completes
-                    if (markdown == null)
-                    {
-                        _ = RefreshWhenParseReadyAsync();
-                    }
+                    _browser.CoreWebView2.WebMessageReceived += OnWebMessageReceived;
+                    _browser.CoreWebView2.NavigationCompleted += OnNavigationCompleted;
+                    _browser.CoreWebView2.SetVirtualHostNameToFolderMapping(
+                        _mappedMarkdownEditorVirtualHostName, GetFolder(), CoreWebView2HostResourceAccessKind.Allow);
+                    _browserReady = true;
+                    _browser.Visibility = Visibility.Visible;
+                    await UpdateBrowserAsync();
                 }
                 catch (Exception ex)
                 {
                     await ex.LogAsync();
                 }
-            }
-
-            async Task RefreshWhenParseReadyAsync()
-            {
-                try
-                {
-                    using CancellationTokenSource timeoutCts = new(TimeSpan.FromSeconds(10));
-                    await _document.WaitForInitialParseAsync(timeoutCts.Token);
-                    await UpdateBrowserAsync();
-                }
-                catch
-                {
-                    // Ignore - document may have been disposed
-                }
-            }
+            }).FireAndForget();
         }
 
         private void BrowserNavigationStarting(object sender, CoreWebView2NavigationStartingEventArgs e)
         {
+            if (e.Uri == "about:blank" || e.Uri?.StartsWith("data:text/html;", StringComparison.Ordinal) == true)
+            {
+                _navigationId = e.NavigationId;
+                return;
+            }
+
             ThreadHelper.JoinableTaskFactory.RunAsync(async () =>
             {
                 if (e.Uri == null)
@@ -784,7 +629,7 @@ namespace MarkdownEditor2022
                 // Handle browsing-file-host links (resolved absolute paths via virtual host)
                 if (uri.Authority == _mappedBrowsingFileVirtualHostName)
                 {
-                    string previewRoot = _previewRoot ?? GetPreviewRoot();
+                    string previewRoot = _previewRoot;
                     if (!TryResolveVirtualHostPath(uri.LocalPath, previewRoot, out string absolutePath))
                     {
                         return;
@@ -797,7 +642,7 @@ namespace MarkdownEditor2022
                 // Handle file:// URLs only when they remain inside the permitted preview root.
                 if (uri.IsAbsoluteUri && uri.Scheme == "file")
                 {
-                    string previewRoot = _previewRoot ?? GetPreviewRoot();
+                    string previewRoot = _previewRoot;
                     if (IsPathWithinPreviewRoot(uri.LocalPath, previewRoot))
                     {
                         await HandleFileNavigationAsync(uri.LocalPath, uri.Fragment);
@@ -1195,7 +1040,7 @@ namespace MarkdownEditor2022
 
         public Task UpdatePositionAsync(int line, bool isTyping, bool fromEditor = false)
         {
-            if (_isDisposed || IsScrollSyncSuppressed)
+            if (_isDisposed || !AdvancedOptions.Instance.EnablePreviewWindow || IsScrollSyncSuppressed)
             {
                 return Task.CompletedTask;
             }
@@ -1204,7 +1049,7 @@ namespace MarkdownEditor2022
             return ThreadHelper.JoinableTaskFactory.StartOnIdle(async () =>
             {
                 // Input and newer editor requests can arrive while this work waits for idle.
-                if (_isDisposed || IsScrollSyncSuppressed || !_scrollSync.CanApply(version))
+                if (_isDisposed || !AdvancedOptions.Instance.EnablePreviewWindow || IsScrollSyncSuppressed || !_scrollSync.CanApply(version))
                 {
                     return;
                 }
@@ -1265,7 +1110,8 @@ namespace MarkdownEditor2022
 
         public Task RefreshAsync()
         {
-            return UpdateBrowserAsync();
+            InvalidateThemeCache();
+            return ForceFullRefreshAsync();
         }
 
         private async Task<bool> IsHtmlTemplateLoadedAsync()
@@ -1276,6 +1122,8 @@ namespace MarkdownEditor2022
         public async Task UpdateBrowserAsync()
         {
             CancellationTokenSource updateCancellation = new();
+            CancellationToken updateToken = updateCancellation.Token;
+            int updateVersion;
             lock (_updateCancellationLock)
             {
                 if (_isDisposed)
@@ -1287,27 +1135,29 @@ namespace MarkdownEditor2022
                 CancellationTokenSource previousUpdate = _updateCancellation;
                 _updateCancellation = updateCancellation;
                 previousUpdate?.Cancel();
+                updateVersion = ++_updateVersion;
             }
 
-            int updateVersion = Interlocked.Increment(ref _updateVersion);
-            CancellationToken updateToken = updateCancellation.Token;
-
+            bool gateAcquired = false;
             try
             {
-                await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
+                await _updateGate.WaitAsync(updateToken);
+                gateAcquired = true;
+                await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync(updateToken);
 
-                if (_isDisposed || updateToken.IsCancellationRequested)
+                if (_isDisposed || !_browserReady || !AdvancedOptions.Instance.EnablePreviewWindow || updateToken.IsCancellationRequested)
                 {
                     return;
                 }
 
                 string html;
+                MarkdownDocument renderedMarkdown = null;
 
                 if (IsMermaidFile)
                 {
-                    // For standalone mermaid files, wrap the entire content in a mermaid div
-                    string content = _textView.TextBuffer.CurrentSnapshot.GetText();
-                    html = $"<pre class=\"mermaid\">{WebUtility.HtmlEncode(content)}</pre>";
+                    ITextSnapshot snapshot = _textView.TextBuffer.CurrentSnapshot;
+                    await EnsurePreviewRootAsync(null, updateToken);
+                    html = await Task.Run(() => $"<pre class=\"mermaid\">{WebUtility.HtmlEncode(snapshot.GetText())}</pre>", updateToken);
                 }
                 else
                 {
@@ -1323,7 +1173,13 @@ namespace MarkdownEditor2022
                         return; // Document not yet parsed or parsing failed
                     }
 
-                    html = await RenderMarkdownToHtmlAsync(markdown);
+                    if (!_fullRefreshRequested && ReferenceEquals(markdown, _lastRenderedMarkdown))
+                    {
+                        return;
+                    }
+
+                    html = await RenderMarkdownToHtmlAsync(markdown, updateToken);
+                    renderedMarkdown = markdown;
                 }
 
                 if (updateToken.IsCancellationRequested || updateVersion != Volatile.Read(ref _updateVersion) || _isDisposed)
@@ -1331,7 +1187,19 @@ namespace MarkdownEditor2022
                     return;
                 }
 
-                await UpdateContentAsync(html);
+                if (!_fullRefreshRequested && string.Equals(html, _lastRenderedHtml, StringComparison.Ordinal))
+                {
+                    _lastRenderedMarkdown = renderedMarkdown;
+                    return;
+                }
+
+                // Cancellation stops the host wait, not JavaScript already changing the DOM.
+                // Do not let undo compare against content that may no longer be displayed.
+                _lastRenderedHtml = null;
+                _lastRenderedMarkdown = null;
+                await UpdateContentAsync(html, updateToken);
+                _lastRenderedHtml = html;
+                _lastRenderedMarkdown = renderedMarkdown;
 
                 if (updateToken.IsCancellationRequested || updateVersion != Volatile.Read(ref _updateVersion) || _isDisposed)
                 {
@@ -1351,9 +1219,9 @@ namespace MarkdownEditor2022
                     await SyncNavigationAsync(isTyping: false);
                 }
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException) when (updateToken.IsCancellationRequested)
             {
-                // Timeout waiting for initial parse - ignore
+                // Superseded update or document closure.
             }
             catch (Exception ex)
             {
@@ -1361,6 +1229,11 @@ namespace MarkdownEditor2022
             }
             finally
             {
+                if (gateAcquired)
+                {
+                    _updateGate.Release();
+                }
+
                 lock (_updateCancellationLock)
                 {
                     if (ReferenceEquals(_updateCancellation, updateCancellation))
@@ -1373,7 +1246,7 @@ namespace MarkdownEditor2022
             }
         }
 
-        private static async Task<string> RenderHtmlDocumentAsync(MarkdownDocument md)
+        internal static string RenderHtmlDocument(MarkdownDocument md)
         {
             StringBuilder sb = GetOrCreateStringBuilder();
             try
@@ -1385,7 +1258,6 @@ namespace MarkdownEditor2022
                 htmlRenderer.UseNonAsciiNoEscape = true;
                 htmlRenderer.Render(md);
 
-                await htmlWriter.FlushAsync();
                 string html = htmlWriter.ToString();
 
                 // Replace language aliases with canonical PrismJS language names
@@ -1428,18 +1300,22 @@ namespace MarkdownEditor2022
         /// Renders markdown to HTML and resolves relative paths to absolute virtual host URLs.
         /// Common pipeline used by all rendering code paths.
         /// </summary>
-        private async Task<string> RenderMarkdownToHtmlAsync(MarkdownDocument markdown)
+        private async Task<string> RenderMarkdownToHtmlAsync(MarkdownDocument markdown, CancellationToken cancellationToken)
         {
             if (markdown == null)
             {
                 return string.Empty;
             }
 
-            string html = await RenderHtmlDocumentAsync(markdown);
-            string rootPath = GetEffectiveRootPath(markdown);
+            string rootPath = await EnsurePreviewRootAsync(markdown, cancellationToken);
             string baseDirectory = Path.GetDirectoryName(_file);
-
-            return ResolveRelativePathsToAbsoluteUrls(html, baseDirectory, rootPath);
+            string previewRoot = _previewRoot;
+            return await Task.Run(() =>
+            {
+                string html = RenderHtmlDocument(markdown);
+                cancellationToken.ThrowIfCancellationRequested();
+                return ResolveRelativePathsToAbsoluteUrls(html, baseDirectory, rootPath, previewRoot);
+            }, cancellationToken);
         }
 
         /// <summary>
@@ -1456,11 +1332,32 @@ namespace MarkdownEditor2022
         // Pre-computed virtual host URL prefix to avoid repeated string concatenation
         private const string _virtualHostUrlPrefix = "http://" + _mappedBrowsingFileVirtualHostName + "/";
 
-        private string GetPreviewRoot()
+        private async Task<string> EnsurePreviewRootAsync(MarkdownDocument markdown, CancellationToken cancellationToken)
         {
+            await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync(cancellationToken);
             string documentDirectory = Path.GetDirectoryName(_file);
-            string configured = ResolveConfiguredRootPath(GetEffectiveRootPath(_document.Markdown), documentDirectory);
-            return GetPreviewRoot(documentDirectory, configured);
+            string editorConfigRoot = RootPathResolver.GetRootPathFromEditorConfig(_textView);
+            string rootPath = await Task.Run(() =>
+                RootPathResolver.GetRootPathFromFrontMatter(markdown) ?? editorConfigRoot, cancellationToken);
+            string configured = ResolveConfiguredRootPath(rootPath, documentDirectory);
+
+            if (!_rootResolved || !string.Equals(configured, _resolvedRootSetting, StringComparison.OrdinalIgnoreCase))
+            {
+                string previewRoot = await Task.Run(() => GetPreviewRoot(documentDirectory, configured), cancellationToken);
+                cancellationToken.ThrowIfCancellationRequested();
+                if (!string.IsNullOrEmpty(previewRoot) && !string.Equals(previewRoot, _previewRoot, StringComparison.OrdinalIgnoreCase))
+                {
+                    _browser.CoreWebView2.SetVirtualHostNameToFolderMapping(
+                        _mappedBrowsingFileVirtualHostName, previewRoot, CoreWebView2HostResourceAccessKind.Allow);
+                    _fullRefreshRequested = true;
+                }
+
+                _previewRoot = previewRoot;
+                _resolvedRootSetting = configured;
+                _rootResolved = true;
+            }
+
+            return rootPath;
         }
 
         private static string GetPreviewRoot(string documentDirectory, string configuredRoot)
@@ -1473,8 +1370,9 @@ namespace MarkdownEditor2022
             DirectoryInfo directory = string.IsNullOrWhiteSpace(documentDirectory) ? null : new DirectoryInfo(documentDirectory);
             while (directory != null)
             {
-                if (directory.GetFiles("*.sln").Length > 0 || directory.GetFiles("*.slnx").Length > 0 ||
-                    directory.GetFiles("*.csproj").Length > 0 || Directory.Exists(Path.Combine(directory.FullName, ".git")))
+                if (Directory.Exists(Path.Combine(directory.FullName, ".git")) ||
+                    directory.EnumerateFiles("*.sln").Any() || directory.EnumerateFiles("*.slnx").Any() ||
+                    directory.EnumerateFiles("*.csproj").Any())
                 {
                     return directory.FullName;
                 }
@@ -1509,7 +1407,7 @@ namespace MarkdownEditor2022
         /// <param name="baseDirectory">The directory to resolve relative paths against.</param>
         /// <param name="rootPath">Optional root path from front matter or .editorconfig for resolving root-relative paths (paths starting with /).</param>
         /// <returns>HTML with relative paths converted to absolute virtual host URLs.</returns>
-        private static string ResolveRelativePathsToAbsoluteUrls(string html, string baseDirectory, string rootPath = null)
+        private static string ResolveRelativePathsToAbsoluteUrls(string html, string baseDirectory, string rootPath = null, string previewRoot = null)
         {
             if (string.IsNullOrEmpty(html) || string.IsNullOrEmpty(baseDirectory))
             {
@@ -1525,7 +1423,7 @@ namespace MarkdownEditor2022
             }
 
             rootPath = ResolveConfiguredRootPath(rootPath, baseDirectory);
-            string previewRoot = GetPreviewRoot(baseDirectory, rootPath);
+            previewRoot ??= GetPreviewRoot(baseDirectory, rootPath);
 
             // First, handle root-relative paths
             if (!string.IsNullOrEmpty(rootPath))
@@ -1678,81 +1576,78 @@ namespace MarkdownEditor2022
             });
         }
 
-        private async Task UpdateContentAsync(string html)
+        private async Task UpdateContentAsync(string html, CancellationToken cancellationToken)
         {
-            bool isInit = await IsHtmlTemplateLoadedAsync();
-
-            // Feature detection
-            bool needsPrism = html.IndexOf("language-", StringComparison.OrdinalIgnoreCase) >= 0;
-            bool needsMermaid = html.IndexOf("class=\"mermaid\"", StringComparison.OrdinalIgnoreCase) >= 0 || html.IndexOf("language-mermaid", StringComparison.OrdinalIgnoreCase) >= 0;
-            bool needsMath = html.IndexOf("class=\"math\"", StringComparison.OrdinalIgnoreCase) >= 0;
-
-            if (isInit)
+            int requestId = ++_renderRequestId;
+            TaskCompletionSource<bool> rendered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            _renderCompletion = rendered;
+            try
             {
-                string escapedHtml = EscapeForJavaScript(html);
-
-                // Batch innerHTML assignment + optional feature activation + anchor adjustment into one script call
-                StringBuilder script = new();
-                script.Append("(function(){var c=document.getElementById('___markdown-content___'); if(c){c.innerHTML=\"").Append(escapedHtml).Append("\";}");
-
-                if (needsPrism)
+                string theme = GetMermaidTheme();
+                bool updated = false;
+                if (_isTemplateLoaded && !_fullRefreshRequested)
                 {
-                    // Prism already loaded? highlight. Otherwise, attempt lazy load once.
-                    script.Append(@"if(!window.Prism && !window.__prismLoading){window.__prismLoading=true;var sp=document.createElement('script');sp.src='http://").Append(_mappedMarkdownEditorVirtualHostName).Append(@"/margin/prism.js';sp.onload=function(){if(window.Prism) Prism.highlightAll();};document.head.appendChild(sp);} else if(window.Prism){Prism.highlightAll();}");
-                }
-                if (needsMermaid)
-                {
-                    string mermaidTheme = GetMermaidTheme();
-                    script.Append(@"if(!window.mermaid && !window.__mermaidLoading){window.__mermaidLoading=true;var sm=document.createElement('script');sm.src='http://").Append(_mappedMarkdownEditorVirtualHostName).Append(@"/margin/mermaid.min.js';sm.onload=function(){try{mermaid.initialize({ securityLevel: 'loose', theme: '").Append(mermaidTheme).Append(@"', flowchart:{ htmlLabels:false }, sequence:{ useMaxWidth:true }}); mermaid.init(undefined, document.querySelectorAll('.mermaid'));}catch(e){}};document.head.appendChild(sm);} else if(window.mermaid){try{mermaid.init(undefined, document.querySelectorAll('.mermaid'));}catch(e){}}");
-                }
-                if (needsMath)
-                {
-                    // MathJax lazy load or re-typeset. Configure tex/color extension before the bundle loads
-                    // so that \color, \textcolor, \colorbox and \fcolorbox work in math expressions (issue #219).
-                    script.Append(@"if(!window.MathJax && !window.__mathjaxLoading){window.__mathjaxLoading=true;window.MathJax={tex:{packages:{'[+]':['color']}},loader:{load:['[tex]/color'],paths:{tex:'http://").Append(_mappedMarkdownEditorVirtualHostName).Append(@"/margin'}}};var sj=document.createElement('script');sj.src='http://").Append(_mappedMarkdownEditorVirtualHostName).Append(@"/margin/mathjax.js';sj.onload=function(){if(window.MathJax&&MathJax.typesetPromise){MathJax.typesetPromise().catch(function(e){});}};document.head.appendChild(sj);} else if(window.MathJax&&MathJax.typesetPromise){MathJax.typesetPromise().catch(function(e){});}");
+                    string script = await Task.Run(() =>
+                        $"typeof window.__updateMarkdownPreview === 'function' && window.__updateMarkdownPreview(\"{EscapeForJavaScript(html)}\", \"{theme}\", {requestId});",
+                        cancellationToken);
+                    cancellationToken.ThrowIfCancellationRequested();
+                    updated = await _browser.ExecuteScriptAsync(script) == "true";
                 }
 
-                // Inline anchor adjustment
-                script.Append(@"(function(){for (const anchor of document.links){try{if(anchor && anchor.protocol==='file:'){var pathName=null,hash=anchor.hash;if(hash){pathName=anchor.pathname;anchor.hash=null;anchor.pathname='';}anchor.protocol='about:';if(hash){if(pathName==null||pathName.endsWith('/')){pathName='blank';}anchor.pathname=pathName;anchor.hash=hash;}}}catch(e){}}})();");
-                script.Append("})();");
+                if (!updated)
+                {
+                    string htmlTemplate = await GetHtmlTemplateAsync();
+                    string scripts = $"<script>window.__initializeMarkdownPreview('{theme}', {requestId});</script>";
+                    string page = await Task.Run(() => htmlTemplate.Replace("[content]", html).Replace("[scripts]", scripts), cancellationToken);
+                    cancellationToken.ThrowIfCancellationRequested();
+                    Color bgColor = GetPreviewBackgroundColor();
+                    _browser.DefaultBackgroundColor = System.Drawing.Color.FromArgb(bgColor.A, bgColor.R, bgColor.G, bgColor.B);
+                    _isTemplateLoaded = false;
+                    TaskCompletionSource<bool> navigation = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                    _navigationCompletion = navigation;
+                    _navigationId = 0;
+                    try
+                    {
+                        _browser.NavigateToString(page);
+                        await WaitForPreviewCompletionAsync(navigation.Task, cancellationToken, "loading");
+                    }
+                    finally
+                    {
+                        if (ReferenceEquals(_navigationCompletion, navigation))
+                        {
+                            _navigationCompletion = null;
+                        }
+                    }
+                }
 
-                await _browser.ExecuteScriptAsync(script.ToString());
+                await WaitForPreviewCompletionAsync(rendered.Task, cancellationToken, "rendering");
+                cancellationToken.ThrowIfCancellationRequested();
+                _fullRefreshRequested = false;
             }
-            else
+            finally
             {
-                // Initial navigation path: build scripts only for needed features.
-                string htmlTemplate = GetHtmlTemplate();
-                string scripts = BuildInitialScriptTags(needsPrism, needsMermaid, needsMath);
-                html = htmlTemplate.Replace("[content]", html).Replace("[scripts]", scripts);
-                _isTemplateLoaded = false;
-                _browser.NavigateToString(html);
+                if (ReferenceEquals(_renderCompletion, rendered))
+                {
+                    _renderCompletion = null;
+                }
             }
         }
 
-        private static string BuildInitialScriptTags(bool prism, bool mermaid, bool math = false)
+        private static async Task WaitForPreviewCompletionAsync(Task<bool> completion, CancellationToken cancellationToken, string phase)
         {
-            if (!prism && !mermaid && !math)
+            using CancellationTokenSource timeout = new(TimeSpan.FromSeconds(30));
+            using CancellationTokenSource linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeout.Token);
+            try
             {
-                return string.Empty;
+                if (!await completion.WithCancellation(linked.Token))
+                {
+                    throw new InvalidOperationException($"Failed while {phase} the Markdown preview.");
+                }
             }
-
-            StringBuilder sb = new();
-            if (prism)
+            catch (OperationCanceledException ex) when (timeout.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
             {
-                sb.Append("<script src=\"http://").Append(_mappedMarkdownEditorVirtualHostName).Append("/margin/prism.js\" onload=\"Prism&&Prism.highlightAll()\"></script>");
+                throw new TimeoutException($"Timed out while {phase} the Markdown preview.", ex);
             }
-            if (mermaid)
-            {
-                string theme = GetMermaidTheme();
-                sb.Append("<script src=\"http://").Append(_mappedMarkdownEditorVirtualHostName).Append("/margin/mermaid.min.js\" onload=\"try{mermaid.initialize({ securityLevel:'loose', theme:'").Append(theme).Append("', flowchart:{ htmlLabels:true }, sequence:{ useMaxWidth:true }}); mermaid.init(undefined, document.querySelectorAll('.mermaid'));}catch(e){}\"></script>");
-            }
-            if (math)
-            {
-                // Configure tex/color extension before MathJax bundle initializes (issue #219).
-                sb.Append("<script>window.MathJax={tex:{packages:{'[+]':['color']}},loader:{load:['[tex]/color'],paths:{tex:'http://").Append(_mappedMarkdownEditorVirtualHostName).Append("/margin'}}};</script>");
-                sb.Append("<script src=\"http://").Append(_mappedMarkdownEditorVirtualHostName).Append("/margin/mathjax.js\" onload=\"if(window.MathJax&&MathJax.typesetPromise){MathJax.typesetPromise().catch(function(e){});}\"></script>");
-            }
-            return sb.ToString();
         }
 
         private static string GetMermaidTheme()
@@ -1767,11 +1662,20 @@ namespace MarkdownEditor2022
             return useLightTheme ? "forest" : "dark";
         }
 
-        private string GetHtmlTemplate()
+        private async Task<string> GetHtmlTemplateAsync()
         {
+            await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
             (bool useLightTheme, string themeBgColor, string themeFgColor) = GetThemeColors();
             string scrollbarColor = GetScrollbarColor(useLightTheme);
             bool spellCheck = AdvancedOptions.Instance.EnableSpellCheck;
+            bool clickSync = AdvancedOptions.Instance.EnablePreviewClickSync;
+            string previewRoot = _previewRoot;
+            return await Task.Run(() => BuildHtmlTemplate(useLightTheme, themeBgColor, themeFgColor, scrollbarColor, spellCheck, clickSync, previewRoot));
+        }
+
+        private string BuildHtmlTemplate(bool useLightTheme, string themeBgColor, string themeFgColor, string scrollbarColor, bool spellCheck, bool clickSync, string previewRoot)
+        {
+            PrewarmStaticResources();
             string templateFileName = GetHtmlTemplateFileNameFromResource();
 
             string customHighlightCandidate = FindFileRecursively(Path.GetDirectoryName(_file), "md-styles.css", null);
@@ -1784,9 +1688,10 @@ namespace MarkdownEditor2022
             long prismTicks = SafeGetWriteTime(prismSourcePath).Ticks;
 
             // Include theme colors in cache key so template updates correctly
-            string cacheKey = string.Join("|", useLightTheme ? "light" : "dark", spellCheck ? "spell" : "plain", templateFileName, templateTicks, highlightSourcePath, highlightTicks, prismSourcePath, prismTicks, themeBgColor, themeFgColor, scrollbarColor);
+            string cacheKey = string.Join("|", useLightTheme ? "light" : "dark", spellCheck ? "spell" : "plain", clickSync, templateFileName, highlightSourcePath, prismSourcePath, themeBgColor, themeFgColor, scrollbarColor, previewRoot);
+            string version = string.Join("|", templateTicks, highlightTicks, prismTicks);
 
-            if (!_templateCache.TryGetValue(cacheKey, out string cachedTemplate))
+            if (!_templateCache.TryGetValue(cacheKey, out (string version, string template) cached) || cached.version != version)
             {
                 // Use pre-warmed resources when available, fall back to file I/O
                 string templateRaw = GetTemplateContent(templateFileName);
@@ -1795,7 +1700,7 @@ namespace MarkdownEditor2022
                 // Resolve relative url() paths in custom CSS files (e.g., font-face references)
                 if (usingCustomHighlight)
                 {
-                    cssHighlight = ResolveCssUrls(cssHighlight, Path.GetDirectoryName(highlightSourcePath), GetPreviewRoot());
+                    cssHighlight = ResolveCssUrls(cssHighlight, Path.GetDirectoryName(highlightSourcePath), previewRoot);
                 }
 
                 string cssPrism = GetPrismCss(useLightTheme, prismSourcePath);
@@ -1823,7 +1728,7 @@ namespace MarkdownEditor2022
     <meta charset=""utf-8"" />
     <style>
         html, body {{margin: 0; padding:0; min-height: 100%; display: block;}}
-        #___markdown-content___ {{padding: 5px 5px 10px 5px; min-height: {_browser.ActualHeight - 15}px}}
+        #___markdown-content___ {{padding: 5px 5px 10px 5px; min-height: calc(100vh - 15px)}}
         .markdown-alert {{padding: 1em 1em .5em 1em; margin-bottom: 1em; border-radius: 1em; background: #c0c0c022}}
         .markdown-alert-title {{font-weight: bold; color:inherit}}
         .markdown-alert-title svg {{margin-right: 5px; margin-top: -1px;}}
@@ -1836,22 +1741,25 @@ namespace MarkdownEditor2022
     <div id=""___markdown-content___"" class=""markdown-body"" [CONTENTEDITABLE]>
         [content]
     </div>
+    [updatescript]
     [scripts]
     [scrollinputscript]
     [clicksyncscript]
     ";
-                string clickSyncScript = AdvancedOptions.Instance.EnablePreviewClickSync ? GetClickToSyncScript() : string.Empty;
+                string clickSyncScript = clickSync ? GetClickToSyncScript() : string.Empty;
                 string bodyStyle = usingCustomHighlight ? string.Empty : $" style=\"background-color:{themeBgColor};color:{themeFgColor}\"";
                 string processed = templateRaw
                     .Replace("<head>", defaultHeadBeg)
                     .Replace("[content]", defaultContent)
                     .Replace("[title]", "Markdown Preview")
                     .Replace("<body>", $"<body{bodyStyle}>")
+                    .Replace("[updatescript]", "<script src=\"http://markdown-editor-host/margin/preview-content.js\"></script>")
                     .Replace("[scrollinputscript]", PreviewScrollSync.InputScript)
                     .Replace("[clicksyncscript]", clickSyncScript);
-                _templateCache[cacheKey] = processed;
-                cachedTemplate = processed;
+                cached = (version, processed);
+                _templateCache.Set(cacheKey, cached);
             }
+            string cachedTemplate = cached.template;
             string finalTemplate = spellCheck ? cachedTemplate.Replace("[CONTENTEDITABLE]", "contenteditable") : cachedTemplate.Replace("[CONTENTEDITABLE]", string.Empty);
             return finalTemplate;
 
@@ -2244,13 +2152,17 @@ namespace MarkdownEditor2022
                 dir = dir.Parent;
             } while (dir != null);
 
-            _recursiveFileLookupCache[cacheKey] = (resolvedPath, nowUtc.Add(_fileDiscoveryCacheDuration));
+            _recursiveFileLookupCache.Set(cacheKey, (resolvedPath, nowUtc.Add(_fileDiscoveryCacheDuration)));
             return resolvedPath;
         }
 
         private void OnNavigationCompleted(object sender, CoreWebView2NavigationCompletedEventArgs e)
         {
-            _isTemplateLoaded = e.IsSuccess;
+            if (_navigationCompletion != null && e.NavigationId == _navigationId)
+            {
+                _isTemplateLoaded = e.IsSuccess;
+                _navigationCompletion.TrySetResult(e.IsSuccess);
+            }
         }
 
         private void OnWebMessageReceived(object sender, CoreWebView2WebMessageReceivedEventArgs e)
@@ -2260,6 +2172,26 @@ namespace MarkdownEditor2022
                 string message = e.TryGetWebMessageAsString();
                 if (string.IsNullOrEmpty(message))
                 {
+                    return;
+                }
+
+                bool completed = message.StartsWith("previewComplete:", StringComparison.Ordinal);
+                if (completed || message.StartsWith("previewFailed:", StringComparison.Ordinal))
+                {
+                    int separator = message.IndexOf(':');
+                    if (int.TryParse(message.Substring(separator + 1), NumberStyles.Integer, CultureInfo.InvariantCulture, out int requestId) &&
+                        requestId == _renderRequestId)
+                    {
+                        _renderCompletion?.TrySetResult(completed);
+                    }
+                    return;
+                }
+
+                if (message.StartsWith("previewError:", StringComparison.Ordinal))
+                {
+                    _lastRenderedHtml = null;
+                    _lastRenderedMarkdown = null;
+                    new InvalidOperationException(message.Substring("previewError:".Length)).LogAsync().FireAndForget();
                     return;
                 }
 

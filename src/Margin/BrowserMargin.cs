@@ -25,6 +25,9 @@ namespace MarkdownEditor2022
         private int _browserHostRow;
         private bool _browserAttached;
         private bool _browserAttachQueued;
+        private (bool enabled, bool spellCheck, bool clickSync, Theme theme) _previewSettings;
+        private EventHandler _viewportWidthChanged;
+        private System.Windows.Threading.DispatcherTimer _resizeTimer;
 
         public FrameworkElement VisualElement => this;
         public double MarginSize => 400; // Initial size, actual size is calculated from percentage
@@ -36,6 +39,7 @@ namespace MarkdownEditor2022
             _textView = textview;
             _marginName = marginName;
             _document = textview.TextBuffer.GetDocument();
+            _previewSettings = ReadPreviewSettings();
             Visibility = AdvancedOptions.Instance.EnablePreviewWindow ? Visibility.Visible : Visibility.Collapsed;
 
             SetResourceReference(BackgroundProperty, EnvironmentColors.ToolWindowBackgroundBrushKey);
@@ -43,6 +47,8 @@ namespace MarkdownEditor2022
             Browser = new Browser(textview.TextBuffer.GetFileName(), _document, textview as IWpfTextView, formatMapService);
             Browser._browser.CoreWebView2InitializationCompleted += OnBrowserInitCompleted;
             Dispatcher.UnhandledException += OnDispatcherUnhandledException;
+            AdvancedOptions.Saved += AdvancedOptions_Saved;
+            VSColorTheme.ThemeChanged += OnThemeChange;
 
             // Defer adding the WebView2CompositionControl to the visual tree until this margin
             // is fully parented under a Window. WebView2CompositionControl.Loaded calls
@@ -64,7 +70,7 @@ namespace MarkdownEditor2022
 
         private void QueueBrowserAttach()
         {
-            if (_isDisposed || _browserAttached || _browserAttachQueued)
+            if (_isDisposed || _browserAttached || _browserAttachQueued || !AdvancedOptions.Instance.EnablePreviewWindow)
             {
                 return;
             }
@@ -79,7 +85,7 @@ namespace MarkdownEditor2022
         {
             try
             {
-                if (_isDisposed || _browserAttached || _browserHost == null || Window.GetWindow(this) == null)
+                if (_isDisposed || _browserAttached || _browserHost == null || !AdvancedOptions.Instance.EnablePreviewWindow || Window.GetWindow(this) == null)
                 {
                     return;
                 }
@@ -147,6 +153,7 @@ namespace MarkdownEditor2022
                 return;
             }
 
+            _isDisposed = true;
             Browser._browser.CoreWebView2InitializationCompleted -= OnBrowserInitCompleted;
             Dispatcher.UnhandledException -= OnDispatcherUnhandledException;
             Loaded -= OnMarginLoaded;
@@ -157,15 +164,24 @@ namespace MarkdownEditor2022
             _textView.TextBuffer.Changed -= OnTextBufferChange;
             VSColorTheme.ThemeChanged -= OnThemeChange;
             AdvancedOptions.Saved -= AdvancedOptions_Saved;
+            if (_viewportWidthChanged != null)
+            {
+                _textView.ViewportWidthChanged -= _viewportWidthChanged;
+            }
+            _resizeTimer?.Stop();
 
             Browser.Dispose();
             _debouncer?.Dispose();
 
-            _isDisposed = true;
         }
 
         private void OnBrowserInitCompleted(object sender, CoreWebView2InitializationCompletedEventArgs e)
         {
+            if (_isDisposed)
+            {
+                return;
+            }
+
             if (!e.IsSuccess)
             {
                 HandleBrowserFailure(e.InitializationException ?? new InvalidOperationException("WebView2 initialization failed."));
@@ -181,16 +197,7 @@ namespace MarkdownEditor2022
             _document.Parsed += UpdateBrowser;
             _textView.LayoutChanged += UpdatePosition;
             _textView.TextBuffer.Changed += OnTextBufferChange;
-            AdvancedOptions.Saved += AdvancedOptions_Saved;
-            VSColorTheme.ThemeChanged += OnThemeChange;
-
-            // Browser performs its own initial render
-            // Trigger an extra startup render only for standalone mermaid files,
-            // which use a separate rendering path.
-            if (IsStandaloneMermaidFile(_textView.TextBuffer.GetFileName()))
-            {
-                _ = Browser.UpdateBrowserAsync();
-            }
+            // Browser performs the initial render for both Markdown and Mermaid.
         }
 
         private static bool IsStandaloneMermaidFile(string filePath)
@@ -279,7 +286,6 @@ namespace MarkdownEditor2022
 
                 bool isUpdating = false;
                 bool isDragging = false;
-                System.Windows.Threading.DispatcherTimer resizeTimer = null;
 
                 GridSplitter splitter = new()
                 {
@@ -315,7 +321,7 @@ namespace MarkdownEditor2022
 
                 void UpdateWidthFromPercentage()
                 {
-                    if (isUpdating || isDragging || _textView.ViewportWidth <= 0)
+                    if (_isDisposed || isUpdating || isDragging || _textView.ViewportWidth <= 0)
                     {
                         return;
                     }
@@ -347,32 +353,33 @@ namespace MarkdownEditor2022
                 // Debounced resize handler — reuse a single timer to avoid leaking DispatcherTimer instances
                 void OnViewportWidthChanged(object s, EventArgs e)
                 {
-                    if (isUpdating || isDragging)
+                    if (_isDisposed || isUpdating || isDragging)
                     {
                         return;
                     }
 
-                    if (resizeTimer == null)
+                    if (_resizeTimer == null)
                     {
-                        resizeTimer = new System.Windows.Threading.DispatcherTimer
+                        _resizeTimer = new System.Windows.Threading.DispatcherTimer
                         {
                             Interval = TimeSpan.FromMilliseconds(50)
                         };
-                        resizeTimer.Tick += (_, __) =>
+                        _resizeTimer.Tick += (_, __) =>
                         {
-                            resizeTimer.Stop();
+                            _resizeTimer.Stop();
                             UpdateWidthFromPercentage();
                         };
                     }
                     else
                     {
-                        resizeTimer.Stop();
+                        _resizeTimer.Stop();
                     }
 
-                    resizeTimer.Start();
+                    _resizeTimer.Start();
                 }
 
-                _textView.ViewportWidthChanged += OnViewportWidthChanged;
+                _viewportWidthChanged = OnViewportWidthChanged;
+                _textView.ViewportWidthChanged += _viewportWidthChanged;
 
                 // Set initial width once loaded
                 _ = ThreadHelper.JoinableTaskFactory.StartOnIdle(UpdateWidthFromPercentage);
@@ -414,47 +421,64 @@ namespace MarkdownEditor2022
 
         private void AdvancedOptions_Saved(AdvancedOptions options)
         {
-            Browser.InvalidateThemeCache();
-            ForceRefreshAsync().FireAndForget();
+            ThreadHelper.JoinableTaskFactory.RunAsync(ApplyOptionsAsync).FireAndForget();
         }
 
-        private async Task ForceRefreshAsync()
+        private static (bool enabled, bool spellCheck, bool clickSync, Theme theme) ReadPreviewSettings()
         {
-            AdvancedOptions opts = await AdvancedOptions.GetLiveInstanceAsync();
+            AdvancedOptions options = AdvancedOptions.Instance;
+            return (options.EnablePreviewWindow, options.EnableSpellCheck, options.EnablePreviewClickSync, options.Theme);
+        }
 
-            if (opts.EnablePreviewWindow)
+        private async Task ApplyOptionsAsync()
+        {
+            await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
+            if (_isDisposed)
             {
-                Visibility = Visibility.Visible;
-                await Browser.ForceFullRefreshAsync();
-
-                if (opts.EnableScrollSync)
-                {
-                    int line = _textView.TextSnapshot.GetLineNumberFromPosition(_textView.TextViewLines.FirstVisibleLine.Start.Position);
-                    await Browser.UpdatePositionAsync(line, false);
-                }
+                return;
             }
-            else
+
+            (bool enabled, bool spellCheck, bool clickSync, Theme theme) settings = ReadPreviewSettings();
+            bool changed = settings != _previewSettings;
+            _previewSettings = settings;
+            Visibility = settings.enabled ? Visibility.Visible : Visibility.Collapsed;
+            if (!settings.enabled)
             {
-                Visibility = Visibility.Collapsed;
+                Browser.SuspendUpdates();
+                return;
+            }
+
+            QueueBrowserAttach();
+            if (changed)
+            {
+                Browser.InvalidateThemeCache();
+                await Browser.ForceFullRefreshAsync();
             }
         }
 
         private void OnThemeChange(ThemeChangedEventArgs e)
         {
-            RefreshAsync().FireAndForget();
+            ThreadHelper.JoinableTaskFactory.RunAsync(RefreshAsync).FireAndForget();
         }
 
         public async Task RefreshAsync()
         {
-            AdvancedOptions options = await AdvancedOptions.GetLiveInstanceAsync();
+            await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
+            if (_isDisposed)
+            {
+                return;
+            }
+
+            AdvancedOptions options = AdvancedOptions.Instance;
 
             if (options.EnablePreviewWindow)
             {
                 Visibility = Visibility.Visible;
+                QueueBrowserAttach();
                 await Browser.RefreshAsync();
 
                 // Only sync position on refresh if scroll sync is enabled
-                if (options.EnableScrollSync)
+                if (options.EnableScrollSync && !_textView.IsClosed && _textView.TextViewLines?.FirstVisibleLine != null)
                 {
                     int line = _textView.TextSnapshot.GetLineNumberFromPosition(_textView.TextViewLines.FirstVisibleLine.Start.Position);
                     await Browser.UpdatePositionAsync(line, false);
@@ -468,7 +492,7 @@ namespace MarkdownEditor2022
 
         private void UpdatePosition(object sender, TextViewLayoutChangedEventArgs e)
         {
-            if (!AdvancedOptions.Instance.EnableScrollSync)
+            if (_isDisposed || !AdvancedOptions.Instance.EnablePreviewWindow || !AdvancedOptions.Instance.EnableScrollSync)
             {
                 return;
             }
@@ -492,14 +516,9 @@ namespace MarkdownEditor2022
 
         private void UpdateBrowser(Document document)
         {
-            if (!document.IsParsing)
+            if (!_isDisposed && AdvancedOptions.Instance.EnablePreviewWindow && !document.IsParsing)
             {
-                _ = ThreadHelper.JoinableTaskFactory.StartOnIdle(() =>
-                {
-                    // Use document-specific key for debouncing to prevent cross-document interference
-                    _debouncer.Debounce(() => { _ = Browser.UpdateBrowserAsync(); }, document.FileName);
-
-                }, VsTaskRunContext.UIThreadIdlePriority);
+                _debouncer.Debounce(() => Browser.UpdateBrowserAsync().FireAndForget());
             }
         }
 
@@ -509,12 +528,12 @@ namespace MarkdownEditor2022
 
             // Standalone Mermaid files do not use the Markdown parser, so refresh them directly.
             // Normal Markdown previews refresh from the parser's current-snapshot completion event.
-            if (!_isDisposed && IsStandaloneMermaidFile(_textView.TextBuffer.GetFileName()))
+            if (!_isDisposed && AdvancedOptions.Instance.EnablePreviewWindow && IsStandaloneMermaidFile(_textView.TextBuffer.GetFileName()))
             {
                 _debouncer.Debounce(() => { _ = Browser.UpdateBrowserAsync(); }, _document.FileName);
             }
 
-            if (!AdvancedOptions.Instance.EnableScrollSync || _document.IsParsing)
+            if (!AdvancedOptions.Instance.EnablePreviewWindow || !AdvancedOptions.Instance.EnableScrollSync || _document.IsParsing)
             {
                 return;
             }
