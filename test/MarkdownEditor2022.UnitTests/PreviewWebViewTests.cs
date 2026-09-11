@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using System.Reflection;
 using System.Text;
 using System.Threading;
 using System.Windows;
@@ -20,6 +21,42 @@ namespace MarkdownEditor2022.UnitTests
         private const string MathCount = "Array.from(MathJax.startup.document.math).length";
 
         public TestContext TestContext { get; set; } = null!;
+
+        [TestMethod]
+        [Timeout(90000)]
+        public Task CustomStylesheetRefresh_ReloadsSavedCss() => RunAsync(async page =>
+        {
+            string directory = Path.Combine(Path.GetTempPath(), "MarkdownCssRefresh", Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(directory);
+            try
+            {
+                string cssPath = Path.Combine(directory, "md-styles.css");
+                File.WriteAllText(cssPath, "#probe { color: rgb(1, 2, 3); }");
+                DateTime timestamp = File.GetLastWriteTimeUtc(cssPath);
+                using Browser browser = new(Path.Combine(directory, "test.md"), null!, null!, null!);
+                MethodInfo buildTemplate = typeof(Browser).GetMethod("BuildHtmlTemplate", BindingFlags.Instance | BindingFlags.NonPublic)!;
+                string BuildPage() => ((string)buildTemplate.Invoke(browser,
+                    [true, "#ffffff", "#000000", "#888888", false, false, directory])!)
+                    .Replace("[content]", "<p id=\"probe\">CSS refresh</p>").Replace("[scripts]", string.Empty);
+
+                await page.NavigateAsync(BuildPage(), fullPage: true);
+                await page.AssertScriptAsync("getComputedStyle(document.getElementById('probe')).color === 'rgb(1, 2, 3)'",
+                    "The original custom stylesheet must be applied.");
+
+                File.WriteAllText(cssPath, "#probe { color: rgb(4, 5, 6); }");
+                File.SetLastWriteTimeUtc(cssPath, timestamp);
+                StringAssert.Contains(BuildPage(), "rgb(1, 2, 3)", "The test must exercise an existing cached template.");
+
+                browser.InvalidateThemeCache();
+                await page.NavigateAsync(BuildPage(), fullPage: true);
+                await page.AssertScriptAsync("getComputedStyle(document.getElementById('probe')).color === 'rgb(4, 5, 6)'",
+                    "Invalidation and full reload must pick up saved CSS even when its timestamp is unchanged.");
+            }
+            finally
+            {
+                Directory.Delete(directory, recursive: true);
+            }
+        });
 
         [TestMethod]
         [DataRow("# Heading")]
@@ -273,7 +310,7 @@ namespace MarkdownEditor2022.UnitTests
                 _view.CoreWebView2.WebMessageReceived += (_, args) => _messages.Add(args.TryGetWebMessageAsString());
             }
 
-            internal async Task NavigateAsync(string html)
+            internal async Task NavigateAsync(string html, bool fullPage = false)
             {
                 TaskCompletionSource<bool> navigated = new(TaskCreationOptions.RunContinuationsAsynchronously);
                 void OnNavigation(object? sender, CoreWebView2NavigationCompletedEventArgs args)
@@ -284,7 +321,7 @@ namespace MarkdownEditor2022.UnitTests
                 _view!.CoreWebView2.NavigationCompleted += OnNavigation;
                 try
                 {
-                    _view.NavigateToString("<!doctype html><html><head><meta charset=\"utf-8\"></head><body>" +
+                    _view.NavigateToString(fullPage ? html : "<!doctype html><html><head><meta charset=\"utf-8\"></head><body>" +
                         "<div id=\"___markdown-content___\">" + html + "</div>" +
                         "<script src=\"http://markdown-editor-host/margin/preview-content.js\"></script></body></html>");
                     await WithinAsync(navigated.Task, "navigate to preview");
