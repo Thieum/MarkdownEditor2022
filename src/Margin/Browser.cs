@@ -13,6 +13,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
 using System.Windows.Media;
 using Markdig.Extensions.Yaml;
 using Markdig.Renderers;
@@ -68,7 +69,7 @@ namespace MarkdownEditor2022
         private static readonly string[] _markdownExtensions = [".md", ".markdown", ".mdown", ".mkd"];
         private static readonly string[] _mermaidExtensions = [".mermaid", ".mmd"];
 
-        public readonly WebView2CompositionControl _browser = new() { HorizontalAlignment = HorizontalAlignment.Stretch, Margin = new Thickness(0), Visibility = Visibility.Hidden };
+        public readonly WebView2CompositionControl _browser = new PreviewWebView() { HorizontalAlignment = HorizontalAlignment.Stretch, Margin = new Thickness(0), Visibility = Visibility.Hidden };
 
 
         /// <summary>
@@ -2331,6 +2332,16 @@ namespace MarkdownEditor2022
                     });
                 })();
             </script>";
+        }
+
+        internal sealed class PreviewWebView : WebView2CompositionControl
+        {
+            protected override void OnMouseDoubleClick(MouseButtonEventArgs e)
+            {
+                // WebView2 1.0.3485.44 forwards both MouseDown and MouseDoubleClick as native
+                // button presses. Keep the WPF event, but let OnMouseDown alone feed the browser.
+                RaiseEvent(e);
+            }
         }
     }
 }

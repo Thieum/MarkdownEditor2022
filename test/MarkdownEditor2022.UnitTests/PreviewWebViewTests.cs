@@ -5,6 +5,7 @@ using System.Reflection;
 using System.Text;
 using System.Threading;
 using System.Windows;
+using System.Windows.Input;
 using System.Windows.Threading;
 using Markdig;
 using Markdig.Syntax;
@@ -24,6 +25,36 @@ namespace MarkdownEditor2022.UnitTests
             "<script src=\"http://markdown-editor-host/margin/preview-content.js\"></script>[scripts]</body></html>";
 
         public TestContext TestContext { get; set; } = null!;
+
+        [TestMethod]
+        [DataRow(1, "")]
+        [DataRow(2, "this")]
+        [DataRow(3, "Select this word in a paragraph.")]
+        [Timeout(90000)]
+        public Task CompositionClicks_PreserveNativeSelection(int clickCount, string expectedSelection) => RunAsync(async page =>
+        {
+            await page.NavigateAsync(PreviewTemplate.Replace("[content]", "<p id=\"pragma-line-1\">Select this word in a paragraph.</p>")
+                .Replace("[scripts]", Browser.GetClickToSyncScript()), fullPage: true);
+            await page.ScriptAsync(@"window.__mouseEvents = []; window.__doubleClicks = 0;
+                document.addEventListener('mousedown', e => __mouseEvents.push(e.detail));
+                document.addEventListener('dblclick', () => __doubleClicks++);
+                var range = document.createRange();
+                var text = document.getElementById('pragma-line-1').firstChild;
+                range.setStart(text, 7); range.setEnd(text, 11);
+                window.__wordRect = range.getBoundingClientRect();");
+            int x = await page.NumberAsync("Math.round((__wordRect.left + __wordRect.width / 2) * devicePixelRatio)");
+            int y = await page.NumberAsync("Math.round((__wordRect.top + __wordRect.height / 2) * devicePixelRatio)");
+            int wpfDoubleClicks = await page.ClickAsync(x, y, clickCount);
+            Assert.AreEqual("[" + string.Join(",", Enumerable.Range(1, clickCount)) + "]",
+                await page.ScriptAsync("__mouseEvents"), "Each physical press must reach the browser exactly once.");
+            // Chromium can include trailing whitespace when selecting a word on Windows.
+            Assert.AreEqual("\"" + expectedSelection + "\"", await page.ScriptAsync("getSelection().toString().trim()"),
+                "Single, double, and triple clicks must retain native caret, word, and paragraph selection.");
+            int expectedDoubleClicks = clickCount >= 2 ? 1 : 0;
+            Assert.AreEqual(expectedDoubleClicks, wpfDoubleClicks, "WPF double-click subscribers must still be notified.");
+            Assert.AreEqual(expectedDoubleClicks, await page.NumberAsync("__doubleClicks"),
+                "The browser must still generate its native double-click event.");
+        });
 
         [TestMethod]
         [Timeout(90000)]
@@ -381,7 +412,7 @@ namespace MarkdownEditor2022.UnitTests
             private readonly List<string> _messages = [];
             private readonly string _userData = Path.Combine(AppContext.BaseDirectory, ".webview-tests", Guid.NewGuid().ToString("N"));
             private readonly TaskCompletionSource<bool> _browserExited = new(TaskCreationOptions.RunContinuationsAsynchronously);
-            private WebView2? _view;
+            private Browser.PreviewWebView? _view;
             private Window? _window;
             private CoreWebView2Environment? _environment;
             private bool _browserStarted;
@@ -401,7 +432,7 @@ namespace MarkdownEditor2022.UnitTests
                     throw new AssertFailedException("Real preview tests require the Microsoft Edge WebView2 Evergreen Runtime. Install it on this Windows test machine.", error);
                 }
                 Directory.CreateDirectory(_userData);
-                _view = new WebView2();
+                _view = new Browser.PreviewWebView();
                 _window = new Window
                 {
                     Width = 900, Height = 700, Left = -20000, Top = -20000,
@@ -456,6 +487,35 @@ namespace MarkdownEditor2022.UnitTests
 
             internal Task MouseWheelAsync() => WithinAsync(_view!.CoreWebView2.CallDevToolsProtocolMethodAsync(
                 "Input.dispatchMouseEvent", "{\"type\":\"mouseWheel\",\"x\":200,\"y\":200,\"deltaX\":0,\"deltaY\":500}"), "send browser mousewheel input");
+
+            internal async Task<int> ClickAsync(int x, int y, int clickCount)
+            {
+                // Drive the WPF routed-event path without moving the user's physical pointer.
+                typeof(WebView2CompositionControl).GetField("_mouselocation", BindingFlags.NonPublic | BindingFlags.Instance)!
+                    .SetValue(_view, new System.Drawing.Point(x, y));
+                int doubleClicks = 0;
+                void OnDoubleClick(object sender, MouseButtonEventArgs args) => doubleClicks++;
+                _view!.MouseDoubleClick += OnDoubleClick;
+                try
+                {
+                    for (int count = 1; count <= clickCount; count++)
+                    {
+                        foreach (RoutedEvent routedEvent in new[] { Mouse.MouseDownEvent, Mouse.MouseUpEvent })
+                        {
+                            MouseButtonEventArgs args = new(Mouse.PrimaryDevice, Environment.TickCount, MouseButton.Left)
+                            {
+                                RoutedEvent = routedEvent
+                            };
+                            typeof(MouseButtonEventArgs).GetProperty(nameof(MouseButtonEventArgs.ClickCount))!
+                                .SetValue(args, count);
+                            _view.RaiseEvent(args);
+                            await Task.Delay(30, _deadline);
+                        }
+                    }
+                }
+                finally { _view.MouseDoubleClick -= OnDoubleClick; }
+                return doubleClicks;
+            }
 
             internal bool HasMessage(string message) => _messages.Contains(message);
 
