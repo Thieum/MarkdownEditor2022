@@ -118,7 +118,10 @@ namespace MarkdownEditor2022
             // which can otherwise leave initial parsing incomplete.
             try
             {
-                await _parseSemaphore.WaitAsync(_disposalTokenSource.Token);
+                using CancellationTokenSource waitCts = CancellationTokenSource.CreateLinkedTokenSource(
+                    _disposalTokenSource.Token,
+                    localToken);
+                await _parseSemaphore.WaitAsync(waitCts.Token);
             }
             catch (OperationCanceledException)
             {
