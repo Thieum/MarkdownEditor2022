@@ -58,7 +58,7 @@ namespace MarkdownEditor2022
             }
 
             string htmlFile = GetHtmlFileName(markdownFile);
-            string html = BuildHtmlDocument(markdownFile);
+            string html = await Task.Run(() => BuildHtmlDocument(markdownFile));
             await Task.Run(() => File.WriteAllText(htmlFile, html, new UTF8Encoding(true)));
 
             await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();

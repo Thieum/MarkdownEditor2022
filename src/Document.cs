@@ -20,6 +20,8 @@ namespace MarkdownEditor2022
         private readonly CancellationTokenSource _disposalTokenSource = new();
         private readonly TaskCompletionSource<bool> _initialParseCompletionSource = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly object _parseCancellationLock = new();
+        private int _parseRequestVersion;
+        private int _parseWorkerRunning;
         private bool _isDisposed;
         private string _lastParsedText;
         private int _lastParsedVersion;
@@ -58,7 +60,7 @@ namespace MarkdownEditor2022
             _buffer.Changed += BufferChanged;
             FileName = buffer.GetFileName();
 
-            ParseAsync().FireAndForget();
+            RequestParse();
             AdvancedOptions.Saved += AdvancedOptionsSaved;
         }
 
@@ -85,7 +87,46 @@ namespace MarkdownEditor2022
 
         private void BufferChanged(object sender, TextContentChangedEventArgs e)
         {
-            ParseAsync().FireAndForget();
+            RequestParse();
+        }
+
+        private void RequestParse()
+        {
+            Interlocked.Increment(ref _parseRequestVersion);
+
+            if (Interlocked.Exchange(ref _parseWorkerRunning, 1) == 0)
+            {
+                ParseLoopAsync().FireAndForget();
+            }
+        }
+
+        private async Task ParseLoopAsync()
+        {
+            int observedRequestVersion = 0;
+
+            try
+            {
+                while (!_isDisposed)
+                {
+                    observedRequestVersion = Volatile.Read(ref _parseRequestVersion);
+                    await ParseAsync();
+
+                    if (observedRequestVersion == Volatile.Read(ref _parseRequestVersion))
+                    {
+                        break;
+                    }
+                }
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _parseWorkerRunning, 0);
+
+                if (!_isDisposed && observedRequestVersion != Volatile.Read(ref _parseRequestVersion) &&
+                    Interlocked.Exchange(ref _parseWorkerRunning, 1) == 0)
+                {
+                    ParseLoopAsync().FireAndForget();
+                }
+            }
         }
 
         private async Task ParseAsync()
@@ -274,7 +315,7 @@ namespace MarkdownEditor2022
 
         private void AdvancedOptionsSaved(AdvancedOptions obj)
         {
-            ParseAsync().FireAndForget();
+            RequestParse();
         }
 
         public void Dispose()

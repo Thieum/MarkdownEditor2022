@@ -662,15 +662,20 @@ namespace MarkdownEditor2022
             {
                 try
                 {
-                    // Wait for initial parse with short timeout - don't block initial render too long
-                    using CancellationTokenSource timeoutCts = new(TimeSpan.FromMilliseconds(500));
+                    // Give an already-started parse a brief opportunity to complete, but do not
+                    // delay the first WebView navigation on parsing. The parser completion event
+                    // will replace the initial content as soon as the current snapshot is ready.
+                    using CancellationTokenSource timeoutCts = new(TimeSpan.FromMilliseconds(50));
                     try
                     {
-                        await _document.WaitForInitialParseAsync(timeoutCts.Token);
+                        if (_document.Markdown == null)
+                        {
+                            await _document.WaitForInitialParseAsync(timeoutCts.Token);
+                        }
                     }
                     catch (OperationCanceledException)
                     {
-                        // Parse not ready yet - render with empty content, will update when parse completes
+                        // Parse is still running; render the available snapshot and refresh later.
                     }
 
                     SetVirtualFolderMapping();

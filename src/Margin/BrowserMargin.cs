@@ -507,9 +507,9 @@ namespace MarkdownEditor2022
         {
             _lastEdit = DateTime.Now;
 
-            // Refresh from the edit event as well as the parser completion event. This prevents
-            // a preview update from being lost when parsing is canceled by a subsequent edit.
-            if (!_isDisposed)
+            // Standalone Mermaid files do not use the Markdown parser, so refresh them directly.
+            // Normal Markdown previews refresh from the parser's current-snapshot completion event.
+            if (!_isDisposed && IsStandaloneMermaidFile(_textView.TextBuffer.GetFileName()))
             {
                 _debouncer.Debounce(() => { _ = Browser.UpdateBrowserAsync(); }, _document.FileName);
             }
