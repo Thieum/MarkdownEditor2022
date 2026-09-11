@@ -83,28 +83,15 @@ namespace MarkdownEditor2022
         private DateTime _lastClickNavigationTime = DateTime.MinValue;
 
         /// <summary>
-        /// Timestamp of the last programmatic scroll of the preview. Used to suppress the editor's
-        /// LayoutChanged handler from re-triggering scroll sync, which would create a feedback loop.
-        /// </summary>
-        private DateTime _lastPreviewScrollTime = DateTime.MinValue;
-
-        /// <summary>
         /// Duration to suppress scroll sync after a click navigation to prevent the preview from scrolling away.
         /// </summary>
         private static readonly TimeSpan _scrollSyncSuppressionDuration = TimeSpan.FromMilliseconds(1000);
 
         /// <summary>
-        /// Duration to suppress editor-to-preview scroll sync after a programmatic preview scroll,
-        /// preventing the feedback loop where preview scroll → editor layout change → preview scroll.
-        /// </summary>
-        private static readonly TimeSpan _scrollLoopSuppressionDuration = TimeSpan.FromMilliseconds(500);
-
-        /// <summary>
         /// Returns true if scroll sync from the editor to the preview should be suppressed
-        /// because the preview was recently scrolled programmatically.
+        /// because a preview click is still navigating the editor.
         /// </summary>
         public bool IsScrollSyncSuppressed =>
-            DateTime.UtcNow - _lastPreviewScrollTime < _scrollLoopSuppressionDuration ||
             DateTime.UtcNow - _lastClickNavigationTime < _scrollSyncSuppressionDuration;
 
         // Cache StringBuilder pool and Regex for better performance
@@ -1054,13 +1041,35 @@ namespace MarkdownEditor2022
                     return;
                 }
 
-                int targetLine = _document.Markdown.FindClosestLine(line);
+                int targetLine = GetScrollTargetLine(_document.Markdown, line);
                 if (_currentViewLine != targetLine)
                 {
                     _currentViewLine = targetLine;
                     await SyncNavigationAsync(isTyping, version);
                 }
             }, VsTaskRunContext.UIThreadIdlePriority).Task;
+        }
+
+        internal static int GetScrollTargetLine(MarkdownDocument markdown, int sourceLine)
+        {
+            // The document boundary is not necessarily the first rendered block.
+            return sourceLine == 0 ? 0 : markdown.FindClosestLine(sourceLine);
+        }
+
+        internal static string GetScrollScript(int targetLine, string inputToken)
+        {
+            // Recheck in the renderer as input may precede delivery of its WebMessage.
+            return $@"(function() {{
+                if (window.__previewScrollInput && window.__previewScrollInput !== ""{EscapeForJavaScript(inputToken)}"") return false;
+                if ({targetLine} === 0) {{
+                    document.documentElement.scrollTop = 0;
+                }} else {{
+                    var element = document.getElementById('pragma-line-{targetLine}');
+                    if (!element) return false;
+                    element.scrollIntoView(true);
+                }}
+                return true;
+            }})();";
         }
 
         private async Task SyncNavigationAsync(bool isTyping, int? requestVersion = null)
@@ -1076,24 +1085,7 @@ namespace MarkdownEditor2022
             {
                 if (_currentViewLine == 0 || !isTyping)
                 {
-                    // Recheck in the renderer as input may precede delivery of its WebMessage.
-                    string inputToken = EscapeForJavaScript(_scrollSync.InputToken);
-                    string script = $@"(function() {{
-                        if (window.__previewScrollInput && window.__previewScrollInput !== ""{inputToken}"") return false;
-                        if ({_currentViewLine} === 0) {{
-                            document.documentElement.scrollTop = 0;
-                        }} else {{
-                            var element = document.getElementById('pragma-line-{_currentViewLine}');
-                            if (!element) return false;
-                            element.scrollIntoView(true);
-                        }}
-                        return true;
-                    }})();";
-                    string result = await _browser.ExecuteScriptAsync(script);
-                    if (result == "true")
-                    {
-                        _lastPreviewScrollTime = DateTime.UtcNow;
-                    }
+                    await _browser.ExecuteScriptAsync(GetScrollScript(_currentViewLine, _scrollSync.InputToken));
                 }
             }
             else

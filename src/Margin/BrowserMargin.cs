@@ -497,7 +497,7 @@ namespace MarkdownEditor2022
                 return;
             }
 
-            // Suppress if the preview was recently scrolled programmatically to prevent a feedback loop
+            // A preview click can move the editor; do not immediately scroll the preview back.
             if (Browser.IsScrollSyncSuppressed)
             {
                 return;
@@ -505,7 +505,7 @@ namespace MarkdownEditor2022
 
             // Compare this layout's states, not a position left over from a suppressed event.
             if (_lastEdit < DateTime.Now.AddMilliseconds(-500) &&
-                Math.Abs(e.OldViewState.ViewportTop - e.NewViewState.ViewportTop) > 1.0 &&
+                e.OldViewState.ViewportTop != e.NewViewState.ViewportTop &&
                 !Browser._browser.IsMouseOver && !Browser._browser.IsKeyboardFocusWithin)
             {
                 int firstLine = _textView.TextSnapshot.GetLineNumberFromPosition(_textView.TextViewLines.FirstVisibleLine.Start.Position);

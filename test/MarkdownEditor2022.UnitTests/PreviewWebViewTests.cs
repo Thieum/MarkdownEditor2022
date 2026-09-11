@@ -5,6 +5,8 @@ using System.Text;
 using System.Threading;
 using System.Windows;
 using System.Windows.Threading;
+using Markdig;
+using Markdig.Syntax;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.Wpf;
 
@@ -18,6 +20,34 @@ namespace MarkdownEditor2022.UnitTests
         private const string MathCount = "Array.from(MathJax.startup.document.math).length";
 
         public TestContext TestContext { get; set; } = null!;
+
+        [TestMethod]
+        [DataRow("# Heading")]
+        [DataRow("\n\n# Heading")]
+        [DataRow("---\ntitle: Test\n---\n\n# Heading")]
+        [Timeout(90000)]
+        public Task SourceScrollToTop_ReachesZeroOffset(string beginning) => RunAsync(async page =>
+        {
+            MarkdownDocument markdown = Markdown.Parse(beginning + "\n\n" +
+                string.Concat(Enumerable.Range(0, 100).Select(i => $"Paragraph {i}.\n\n")), Document.Pipeline);
+            await page.NavigateAsync(Browser.RenderHtmlDocument(markdown));
+            await page.ScriptAsync("document.body.style.paddingTop = '80px'; window.scrollTo(0, 400)");
+            await page.AssertScriptAsync("document.documentElement.scrollTop > 0", "The preview must start scrolled down.");
+
+            PreviewScrollSync sync = new();
+            int request = sync.RequestSync(fromEditor: true);
+            Assert.IsTrue(sync.CanApply(request));
+            await page.AssertScriptAsync(Browser.GetScrollScript(Browser.GetScrollTargetLine(markdown, 0), sync.InputToken),
+                "The source-top scroll request was not applied.");
+            await page.AssertScriptAsync("document.documentElement.scrollTop === 0",
+                "Source top must align the document boundary, not the first block below its top padding.");
+
+            await page.ScriptAsync("window.scrollTo(0, 400); window.__previewScrollInput = 'newer-wheel'");
+            await page.AssertScriptAsync("!(" + Browser.GetScrollScript(0, sync.InputToken).TrimEnd(';') + ")",
+                "A newer preview interaction must still reject stale source scrolling.");
+            await page.AssertScriptAsync("document.documentElement.scrollTop > 0",
+                "Rejected source scrolling must preserve the preview position.");
+        });
 
         [TestMethod]
         [Timeout(90000)]

@@ -1,8 +1,33 @@
+using Markdig;
+using Markdig.Syntax;
+
 namespace MarkdownEditor2022.UnitTests
 {
     [TestClass]
     public class PreviewScrollSyncTests
     {
+        [TestMethod]
+        [DataRow("# Heading\n\nParagraph")]
+        [DataRow("\n\n# Heading\n\nParagraph")]
+        [DataRow("---\ntitle: Test\n---\n\n# Heading")]
+        [DataRow("")]
+        public void SourceTop_TargetsDocumentBoundary(string text)
+        {
+            MarkdownDocument markdown = Markdown.Parse(text, Document.Pipeline);
+
+            Assert.AreEqual(0, Browser.GetScrollTargetLine(markdown, 0));
+        }
+
+        [TestMethod]
+        [DataRow(2)]
+        [DataRow(4)]
+        public void SourceBelowTop_PreservesBlockMapping(int line)
+        {
+            MarkdownDocument markdown = Markdown.Parse("# Heading\n\nParagraph\n\n## Next", Document.Pipeline);
+
+            Assert.AreEqual(markdown.FindClosestLine(line), Browser.GetScrollTargetLine(markdown, line));
+        }
+
         [TestMethod]
         public void EditorRequest_CanApply()
         {
