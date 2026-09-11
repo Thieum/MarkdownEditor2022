@@ -19,8 +19,117 @@ namespace MarkdownEditor2022.UnitTests
         private const string Sample = "<p id=\"stable\">Paragraph</p><pre><code class=\"language-javascript\">const value = 1;</code></pre><pre class=\"mermaid\">graph TD; A-->B;</pre><p class=\"math\">\\(x+1\\)</p>";
         private const string Container = "document.getElementById('___markdown-content___')";
         private const string MathCount = "Array.from(MathJax.startup.document.math).length";
+        private const string PreviewTemplate = "<!doctype html><html><head><meta charset=\"utf-8\"></head><body>" +
+            "<div id=\"___markdown-content___\">[content]</div>" +
+            "<script src=\"http://markdown-editor-host/margin/preview-content.js\"></script>[scripts]</body></html>";
 
         public TestContext TestContext { get; set; } = null!;
+
+        [TestMethod]
+        [Timeout(90000)]
+        public Task LargeDocument_InitialRenderRefreshAndUndo_BypassNavigationLimit() => RunAsync(async page =>
+        {
+            string source = string.Concat(Enumerable.Range(0, 19000).Select(i =>
+                $"Paragraph {i} {new string('a', 120)}.\n\n"));
+            MarkdownDocument markdown = Markdown.Parse(source, Document.Pipeline);
+            string html = Browser.RenderHtmlDocument(markdown) + Sample;
+            Assert.IsTrue(Encoding.UTF8.GetByteCount(html) > 2 * 1024 * 1024, "Exercise content beyond WebView2's limit.");
+            page.AssertNavigationTooLarge(PreviewTemplate.Replace("[content]", html).Replace("[scripts]", string.Empty));
+            Stopwatch timer = Stopwatch.StartNew();
+            for (int request = 1; request <= 2; request++)
+            {
+                (string shell, bool hydrate) = Browser.BuildPreviewPage(PreviewTemplate, html, "default", request);
+                Assert.IsTrue(hydrate, "Initial load and forced refresh must keep document content out of NavigateToString.");
+                await page.NavigateAsync(shell, fullPage: true);
+                await page.UpdateAndCompleteAsync(html, request);
+                await page.AssertScriptAsync($"{Container}.querySelectorAll(':scope > p').length === 19002 && {Container}.textContent.includes('Paragraph 18999')",
+                    "The complete large document must render without truncation.");
+                await page.AssertScriptAsync("!!document.querySelector('.mermaid svg') && !!document.querySelector('.math mjx-container')",
+                    "Large-document hydration must finish lazy feature rendering.");
+            }
+            await page.UpdateAndCompleteAsync(html + "<p id=\"edit\">Edit</p>", 3);
+            await page.UpdateAndCompleteAsync(html, 4);
+            await page.AssertScriptAsync("!document.getElementById('edit')", "Undo must remove the last edit.");
+            page.AssertNoErrors();
+            TestContext.WriteLine($"38,000 source lines, {Encoding.UTF8.GetByteCount(html)} HTML bytes; initial load, refresh, edit and undo: {timer.ElapsedMilliseconds} ms.");
+        });
+
+        [TestMethod]
+        [Timeout(90000)]
+        public Task PreviewSelection_DoesNotNavigate_ButPlainClickDoes() => RunAsync(async page =>
+        {
+            await page.NavigateAsync(PreviewTemplate.Replace("[content]", "<p id=\"pragma-line-1\">Select this word</p>")
+                .Replace("[scripts]", Browser.GetClickToSyncScript()), fullPage: true);
+            await page.ScriptAsync(@"var text = document.getElementById('pragma-line-1').firstChild;
+                var range = document.createRange(); range.setStart(text, 7); range.setEnd(text, 11);
+                var selection = getSelection(); selection.removeAllRanges(); selection.addRange(range);
+                text.parentElement.dispatchEvent(new MouseEvent('click', { bubbles: true, detail: 1 }));");
+            await page.AssertScriptAsync("getSelection().toString() === 'this'", "Click handling must preserve the selected text.");
+            Assert.IsFalse(page.HasMessage("navigate:1"), "Drag selection must not trigger source navigation.");
+            await page.ScriptAsync(@"getSelection().removeAllRanges();
+                document.getElementById('pragma-line-1').dispatchEvent(new MouseEvent('click', { bubbles: true, detail: 2 }));");
+            Assert.IsFalse(page.HasMessage("navigate:1"), "The second click of a double-click must not navigate.");
+            await page.ScriptAsync("document.getElementById('pragma-line-1').dispatchEvent(new MouseEvent('click', { bubbles: true, detail: 1 }));");
+            await page.WaitForMessageAsync("navigate:1");
+        });
+
+        [TestMethod]
+        [Timeout(90000)]
+        public Task PreviewMouseWheel_KeepsPositionUntilNewSourceScroll() => RunAsync(async page =>
+        {
+            await page.NavigateAsync(PreviewTemplate.Replace("[content]",
+                "<p style=\"height:10000px\">Scrollable preview</p>").Replace("[scripts]", PreviewScrollSync.InputScript), fullPage: true);
+            PreviewScrollSync sync = new();
+            int queued = sync.RequestSync(fromEditor: true);
+            await page.MouseWheelAsync();
+            await page.UntilAsync("document.documentElement.scrollTop > 0 && !!window.__previewScrollInput", "real browser wheel input");
+            string token = await page.ScriptAsync("window.__previewScrollInput");
+            // Input tokens contain only timestamp, sequence, and a hyphen.
+            sync.OnPreviewInteraction(token.Trim('"'));
+            Assert.IsFalse(sync.CanApply(queued));
+            Assert.IsFalse(sync.CanApply(sync.RequestSync(fromEditor: false)), "Refresh must not reclaim preview scroll ownership.");
+            await page.AssertScriptAsync("!(" + Browser.GetScrollScript(0, string.Empty).TrimEnd(';') + ")",
+                "The renderer must reject a source request queued before wheel input.");
+            await page.AssertScriptAsync("document.documentElement.scrollTop > 0", "Preview wheel position must be retained.");
+            Assert.IsTrue(sync.CanApply(sync.RequestSync(fromEditor: true)));
+            await page.AssertScriptAsync(Browser.GetScrollScript(0, sync.InputToken), "New source scrolling should resume sync.");
+            await page.AssertScriptAsync("document.documentElement.scrollTop === 0", "Explicit source scrolling must still work.");
+        });
+
+        [TestMethod]
+        [Timeout(90000)]
+        public Task CustomStylesheetFont_LoadsThroughVirtualHost() => RunAsync(async page =>
+        {
+            string directory = Path.Combine(Path.GetTempPath(), "MarkdownFont", Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(directory);
+            try
+            {
+                string font = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Fonts), "arial.ttf");
+                Assert.IsTrue(File.Exists(font), "This Windows browser test requires the installed Arial font.");
+                File.Copy(font, Path.Combine(directory, "Preview Font.ttf"));
+                File.WriteAllText(Path.Combine(directory, "md-styles.css"),
+                    "@font-face { font-family: PreviewRegression; src: url('./Preview Font.ttf'); } #probe { font-family: PreviewRegression; }");
+                using Browser browser = new(Path.Combine(directory, "test.md"), null!, null!, null!);
+                MethodInfo buildTemplate = typeof(Browser).GetMethod("BuildHtmlTemplate", BindingFlags.Instance | BindingFlags.NonPublic)!;
+                string html = ((string)buildTemplate.Invoke(browser, [true, "#ffffff", "#000000", "#888888", false, false, directory])!)
+                    .Replace("[content]", "<p id=\"probe\">Font probe</p>").Replace("[scripts]", string.Empty);
+                page.MapDocumentRoot(directory);
+                await page.NavigateAsync(html, fullPage: true);
+                await page.ScriptAsync(@"window.__fontStatus = 'waiting';
+                    document.fonts.load('16px PreviewRegression').then(fonts => {
+                        window.__fontStatus = fonts.length === 1 && fonts[0].status === 'loaded' ? 'loaded' : 'missing';
+                    }, error => { window.__fontStatus = error.message; });");
+                await page.UntilAsync("window.__fontStatus !== 'waiting'", "custom font load");
+                await page.AssertScriptAsync("window.__fontStatus === 'loaded'",
+                    "The custom font must load, not merely fall back. Status: " + await page.ScriptAsync("window.__fontStatus"));
+                await page.AssertScriptAsync("performance.getEntriesByType('resource').some(e => e.name.includes('browsing-file-host') && e.name.includes('Preview%20Font.ttf'))",
+                    "The font must be fetched through the mapped document host.");
+            }
+            finally
+            {
+                Directory.Delete(directory, recursive: true);
+            }
+        });
 
         [TestMethod]
         [Timeout(90000)]
@@ -321,9 +430,7 @@ namespace MarkdownEditor2022.UnitTests
                 _view!.CoreWebView2.NavigationCompleted += OnNavigation;
                 try
                 {
-                    _view.NavigateToString(fullPage ? html : "<!doctype html><html><head><meta charset=\"utf-8\"></head><body>" +
-                        "<div id=\"___markdown-content___\">" + html + "</div>" +
-                        "<script src=\"http://markdown-editor-host/margin/preview-content.js\"></script></body></html>");
+                    _view.NavigateToString(fullPage ? html : PreviewTemplate.Replace("[content]", html).Replace("[scripts]", string.Empty));
                     await WithinAsync(navigated.Task, "navigate to preview");
                     await AssertScriptAsync("typeof __initializeMarkdownPreview === 'function' && typeof __updateMarkdownPreview === 'function'",
                         "The native preview-content.js entry points were not installed.");
@@ -335,9 +442,32 @@ namespace MarkdownEditor2022.UnitTests
 
             internal Task UpdateAsync(string html, int id)
             {
-                string encoded = Convert.ToBase64String(Encoding.UTF8.GetBytes(html));
-                return AssertScriptAsync($"__updateMarkdownPreview(new TextDecoder().decode(Uint8Array.from(atob('{encoded}'), c => c.charCodeAt(0))), 'default', {id}) === true",
+                return AssertScriptAsync(Browser.BuildContentUpdateScript(html, "default", id),
                     "Update must immediately accept the request.");
+            }
+
+            internal void AssertNavigationTooLarge(string html)
+            {
+                Assert.ThrowsExactly<ArgumentException>(() => _view!.NavigateToString(html));
+            }
+
+            internal void MapDocumentRoot(string directory) =>
+                _view!.CoreWebView2.SetVirtualHostNameToFolderMapping("browsing-file-host", directory, CoreWebView2HostResourceAccessKind.Allow);
+
+            internal Task MouseWheelAsync() => WithinAsync(_view!.CoreWebView2.CallDevToolsProtocolMethodAsync(
+                "Input.dispatchMouseEvent", "{\"type\":\"mouseWheel\",\"x\":200,\"y\":200,\"deltaX\":0,\"deltaY\":500}"), "send browser mousewheel input");
+
+            internal bool HasMessage(string message) => _messages.Contains(message);
+
+            internal async Task WaitForMessageAsync(string message)
+            {
+                Stopwatch timer = Stopwatch.StartNew();
+                while (!HasMessage(message))
+                {
+                    _deadline.ThrowIfCancellationRequested();
+                    Assert.IsTrue(timer.Elapsed < TimeSpan.FromSeconds(5), $"Missing WebView2 message: {message}");
+                    await Task.Delay(20, _deadline);
+                }
             }
 
             internal async Task UpdateAndCompleteAsync(string html, int id)

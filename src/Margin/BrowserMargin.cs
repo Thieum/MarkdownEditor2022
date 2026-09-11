@@ -245,11 +245,7 @@ namespace MarkdownEditor2022
                         new SnapshotSpan(point, point),
                         EnsureSpanVisibleOptions.AlwaysCenter);
 
-                    // Set focus to the editor
-                    if (_textView is IWpfTextView wpfTextView)
-                    {
-                        wpfTextView.VisualElement.Focus();
-                    }
+                    // Keep focus in the preview so selection, copy and its context menu keep working.
                 }
                 catch (Exception ex)
                 {

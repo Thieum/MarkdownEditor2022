@@ -44,5 +44,47 @@ namespace MarkdownEditor2022.UnitTests
                 }
             }
         }
+
+        [TestMethod]
+        public void BuildHtmlDocument_NormalizesIconHeadingIdsAndTocLinks()
+        {
+            string directory = Path.Combine(AppContext.BaseDirectory, "HeadingIdTests", Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(directory);
+            string markdownFile = Path.Combine(directory, "icons.md");
+
+            try
+            {
+                File.WriteAllText(markdownFile, """
+                    [[_TOC_]]
+
+                    ### Flyout (<u>&#xF035C;</u>)
+
+                    ### Flyout (<u>&#xF035C;</u>)
+
+                    ### Use (<u>&#xF02FA;</u>)
+
+                    ### Add (<u>&#xF0419;</u>)
+
+                    ### Release- (<u>&#xF035C;</u>)
+
+                    ### Custom (<u>&#xF035C;</u>) {#custom-}
+                    """);
+
+                string html = HtmlGenerationService.BuildHtmlDocument(markdownFile);
+                foreach (string id in new[] { "flyout", "flyout-1", "use", "add", "release-", "custom-" })
+                {
+                    StringAssert.Contains(html, $"<h3 id=\"{id}\">");
+                    StringAssert.Contains(html, $"href=\"#{id}\"");
+                }
+
+                StringAssert.Contains(html, "<u>");
+                Assert.IsFalse(html.Contains("id=\"flyout--1\""));
+                Assert.IsFalse(html.Contains("id=\"\""));
+            }
+            finally
+            {
+                Directory.Delete(directory, true);
+            }
+        }
     }
 }

@@ -23,6 +23,7 @@ namespace MarkdownEditor2022
         private ITextSnapshot _parsedSnapshot;
 
         public static MarkdownPipeline Pipeline { get; } = new MarkdownPipelineBuilder()
+            .UseNormalizedHeadingIdentifiers()  // Capture generated IDs before AutoIdentifiers runs
             .UseAutoIdentifiers(AutoIdentifierOptions.GitHub)  // Must be BEFORE UseAdvancedExtensions to override default
             .UseAdvancedExtensions()
             .UseTocToken()  // Support for [[_TOC_]] Azure DevOps wiki syntax
@@ -33,6 +34,7 @@ namespace MarkdownEditor2022
             .Build();
 
         public static MarkdownPipeline PipelineToGenerateHtml { get; } = new MarkdownPipelineBuilder()
+            .UseNormalizedHeadingIdentifiers()
             .UseAutoIdentifiers(AutoIdentifierOptions.GitHub)  // Must be BEFORE UseAdvancedExtensions to override default
             .UseAdvancedExtensions()
             .UseTocToken()  // Support for [[_TOC_]] Azure DevOps wiki syntax

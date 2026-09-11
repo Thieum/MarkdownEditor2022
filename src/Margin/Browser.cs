@@ -122,7 +122,7 @@ namespace MarkdownEditor2022
         // Regex for resolving relative paths in CSS url() references
         // Matches url("...") or url('...') or url(...) with relative paths (not starting with http, https, data:, or /)
         private static readonly Regex _cssUrlRegex = new(
-            @"url\(\s*['""]?(?<path>(?!https?://|data:|/)[^'"")\s]+)['""]?\s*\)",
+            @"url\(\s*(?:(?<quote>['""])(?<path>(?!https?://|data:|/)[^'""]+)\k<quote>|(?<path>(?!https?://|data:|/)[^'"")\s]+))\s*\)",
             RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
 
         // PrismJS language alias mappings (based on components.json from PrismJS)
@@ -1580,7 +1580,7 @@ namespace MarkdownEditor2022
                 if (_isTemplateLoaded && !_fullRefreshRequested)
                 {
                     string script = await Task.Run(() =>
-                        $"typeof window.__updateMarkdownPreview === 'function' && window.__updateMarkdownPreview(\"{EscapeForJavaScript(html)}\", \"{theme}\", {requestId});",
+                        BuildContentUpdateScript(html, theme, requestId),
                         cancellationToken);
                     cancellationToken.ThrowIfCancellationRequested();
                     updated = await _browser.ExecuteScriptAsync(script) == "true";
@@ -1589,8 +1589,7 @@ namespace MarkdownEditor2022
                 if (!updated)
                 {
                     string htmlTemplate = await GetHtmlTemplateAsync();
-                    string scripts = $"<script>window.__initializeMarkdownPreview('{theme}', {requestId});</script>";
-                    string page = await Task.Run(() => htmlTemplate.Replace("[content]", html).Replace("[scripts]", scripts), cancellationToken);
+                    (string page, bool hydrate) = await Task.Run(() => BuildPreviewPage(htmlTemplate, html, theme, requestId), cancellationToken);
                     cancellationToken.ThrowIfCancellationRequested();
                     Color bgColor = GetPreviewBackgroundColor();
                     _browser.DefaultBackgroundColor = System.Drawing.Color.FromArgb(bgColor.A, bgColor.R, bgColor.G, bgColor.B);
@@ -1602,6 +1601,15 @@ namespace MarkdownEditor2022
                     {
                         _browser.NavigateToString(page);
                         await WaitForPreviewCompletionAsync(navigation.Task, cancellationToken, "loading");
+                        if (hydrate)
+                        {
+                            string script = await Task.Run(() => BuildContentUpdateScript(html, theme, requestId), cancellationToken);
+                            cancellationToken.ThrowIfCancellationRequested();
+                            if (await _browser.ExecuteScriptAsync(script) != "true")
+                            {
+                                throw new InvalidOperationException("The Markdown preview did not accept the initial document content.");
+                            }
+                        }
                     }
                     finally
                     {
@@ -1624,6 +1632,30 @@ namespace MarkdownEditor2022
                 }
             }
         }
+
+        internal static string BuildContentUpdateScript(string html, string theme, int requestId) =>
+            $"typeof window.__updateMarkdownPreview === 'function' && window.__updateMarkdownPreview(\"{EscapeForJavaScript(html)}\", \"{EscapeForJavaScript(theme)}\", {requestId});";
+
+        internal static (string page, bool hydrate) BuildPreviewPage(string template, string html, string theme, int requestId)
+        {
+            string scripts = $"<script>window.__initializeMarkdownPreview('{theme}', {requestId});</script>";
+            string page = template.Replace("[content]", html).Replace("[scripts]", scripts);
+            if (!ExceedsNavigationLimit(page))
+            {
+                return (page, false);
+            }
+
+            // NavigateToString has a 2 MB limit. Send large documents through the existing update channel.
+            string shell = template.Replace("[content]", string.Empty).Replace("[scripts]", string.Empty);
+            if (ExceedsNavigationLimit(shell))
+            {
+                throw new InvalidOperationException("The Markdown preview template and styles exceed WebView2's 2 MB navigation limit.");
+            }
+            return (shell, true);
+        }
+
+        private static bool ExceedsNavigationLimit(string page) =>
+            page.Length > 1024 * 1024 || Encoding.UTF8.GetByteCount(page) > 2 * 1024 * 1024;
 
         private static async Task WaitForPreviewCompletionAsync(Task<bool> completion, CancellationToken cancellationToken, string phase)
         {
@@ -2218,7 +2250,7 @@ namespace MarkdownEditor2022
         /// and posts a message to navigate to that line.
         /// Ignores clicks on interactive elements like links, form elements, and expanders.
         /// </summary>
-        private static string GetClickToSyncScript()
+        internal static string GetClickToSyncScript()
         {
             return @"<script>
                 (function() {
@@ -2285,6 +2317,9 @@ namespace MarkdownEditor2022
                     }
 
                     document.addEventListener('click', function(e) {
+                        // Selecting text is not a request to navigate the source editor.
+                        var selection = window.getSelection();
+                        if (e.button !== 0 || e.detail > 1 || (selection && !selection.isCollapsed)) return;
                         // Skip if clicking on an interactive element
                         if (isInteractiveElement(e.target)) return;
 

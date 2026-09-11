@@ -11,6 +11,30 @@ namespace MarkdownEditor2022.UnitTests
         public TestContext TestContext { get; set; } = null!;
 
         [TestMethod]
+        public void BuildPreviewPage_SmallDocument_PreservesInlineInitialization()
+        {
+            (string page, bool hydrate) = Browser.BuildPreviewPage("<body>[content][scripts]</body>", "<p>Text</p>", "default", 7);
+            Assert.IsFalse(hydrate);
+            StringAssert.Contains(page, "<p>Text</p>");
+            StringAssert.Contains(page, "__initializeMarkdownPreview('default', 7)");
+        }
+
+        [TestMethod]
+        public void BuildPreviewPage_LargeDocument_UsesEmptyShell()
+        {
+            (string page, bool hydrate) = Browser.BuildPreviewPage("<body>[content][scripts]</body>", new string('x', 2 * 1024 * 1024), "default", 7);
+            Assert.IsTrue(hydrate);
+            Assert.AreEqual("<body></body>", page);
+        }
+
+        [TestMethod]
+        public void BuildPreviewPage_OversizedTemplate_ReportsLimit()
+        {
+            Assert.ThrowsExactly<InvalidOperationException>(() =>
+                Browser.BuildPreviewPage(new string('x', 2 * 1024 * 1024) + "[content][scripts]", "", "default", 7));
+        }
+
+        [TestMethod]
         public async Task PreviewContentScript_NodeBehaviorTestsPass()
         {
             string outputDirectory = AppContext.BaseDirectory;

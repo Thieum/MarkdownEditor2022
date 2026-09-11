@@ -74,6 +74,10 @@ The preview window is automatically scrolled to match the scroll position of the
 
 Live preview can be managed in the [settings](#settings).
 
+When preview click synchronization is enabled, a plain click updates the source
+position without taking keyboard focus away from the preview. Selecting text or
+double-clicking a word does not trigger an additional source navigation.
+
 ### Syntax highlighting
 
 All fonts can be changed in **Tools -> Options -> Environment -> Fonts and Colors** dialog.
@@ -312,6 +316,11 @@ Type `#` inside a link to get completions for all headings in the current docume
 
 Headings are shown with their level indicator (H1, H2, etc.) and automatically generate GitHub-compatible anchor slugs. Duplicate headings are handled with `-1`, `-2` suffixes.
 
+Headings ending in inline HTML icons no longer acquire an incidental trailing
+hyphen (for example, `Flyout (<u>&#xF035C;</u>)` links to `#flyout`). Explicit
+`{#custom-id}` anchors and literal hyphens are preserved. Links using the previous
+incidental trailing-hyphen IDs should be updated; legacy aliases are not generated.
+
 **Cross-document anchors:** You can also get anchor completions for other markdown files by typing the file path followed by `#`:
 
 ```markdown
@@ -472,6 +481,13 @@ Right-click a markdown file in **Solution Explorer** and select **Generate HTML 
 - The generated file is nested under the markdown file in Solution Explorer.
 - On subsequent saves of the markdown file, the `.html` file is regenerated automatically.
 - Run the command again to disable this behavior and remove the generated file.
+
+Automatic regeneration requires a project that supports nesting the generated HTML
+under the markdown file using `DependentUpon` metadata. Files in solution folders,
+loose files, and Open Folder workspaces do not enable regeneration merely by having
+a sibling `.html` file. Add the markdown file to a supported project (including a
+shared project) and run **Generate HTML file** there. For unsupported items, the
+command can generate a one-time HTML snapshot, but saves will not update it.
 
 ## Context menu
 
