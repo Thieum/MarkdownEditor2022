@@ -326,6 +326,55 @@ namespace MarkdownEditor2022.UnitTests
             Assert.AreEqual("http://browsing-file-host/Projects/Site/my docs/test file.md", result);
         }
 
+        [TestMethod]
+        public void BrowserResolveRelativePath_ParentDirectory_PreservesParentTraversal()
+        {
+            string result = Browser.ResolveRelativePath(
+                "src", "../images/diagram.png", @"C:\Projects\Docs", @"C:\");
+
+            Assert.AreEqual("src=\"http://browsing-file-host/Projects/images/diagram.png\"", result);
+        }
+
+        [TestMethod]
+        public void BrowserResolveRootRelativePath_UsesConfiguredRootPath()
+        {
+            string result = Browser.ResolveRootRelativePath(
+                "href", "/.attachments/image.png", @"C:\Projects\Wiki", @"C:\");
+
+            Assert.AreEqual("href=\"http://browsing-file-host/Projects/Wiki/.attachments/image.png\"", result);
+        }
+
+        [TestMethod]
+        public void BrowserTryResolveVirtualHostPath_RejectsTraversalOutsidePreviewRoot()
+        {
+            bool resolved = Browser.TryResolveVirtualHostPath(
+                "/..%2FSecrets\u002Fcredentials.txt", @"C:\Projects\Wiki", out _);
+
+            Assert.IsFalse(resolved);
+        }
+
+        [DataRow(@"C:\Projects\Wiki\docs\page.md", true)]
+        [DataRow(@"C:\Projects\Wiki2\secret.md", false)]
+        [DataRow(@"C:\Secrets\credentials.txt", false)]
+        [TestMethod]
+        public void BrowserIsPathWithinPreviewRoot_EnforcesBoundary(string filePath, bool expected)
+        {
+            Assert.AreEqual(expected, Browser.IsPathWithinPreviewRoot(filePath, @"C:\Projects\Wiki"));
+        }
+
+        [DataRow("Edit.GoToAll", true)]
+        [DataRow("View.SolutionExplorer", true)]
+        [DataRow("Build.BuildSolution", true)]
+        [DataRow("File.Delete", false)]
+        [DataRow("C:\\Windows\\System32", false)]
+        [DataRow("Edit/FormatDocument", false)]
+        [DataRow("", false)]
+        [TestMethod]
+        public void IsSafeVisualStudioCommand_ValidatesCommandShape(string command, bool expected)
+        {
+            Assert.AreEqual(expected, Browser.IsSafeVisualStudioCommand(command));
+        }
+
         #endregion
 
         #region HTML Generation Tests
@@ -338,6 +387,16 @@ namespace MarkdownEditor2022.UnitTests
             Assert.IsTrue(HtmlGenerationService.IsMarkdownFile(@"C:\Docs\file.mermaid"));
             Assert.IsTrue(HtmlGenerationService.IsMarkdownFile(@"C:\Docs\file.mmd"));
             Assert.IsFalse(HtmlGenerationService.IsMarkdownFile(@"C:\Docs\file.txt"));
+        }
+
+        [DataRow(".mermaid")]
+        [DataRow(".MERMAID")]
+        [DataRow(".mmd")]
+        [DataRow(".MMD")]
+        [TestMethod]
+        public void IsMarkdownFile_StandaloneMermaidExtensions_AreSupported(string extension)
+        {
+            Assert.IsTrue(HtmlGenerationService.IsMarkdownFile(@"C:\Docs\diagram" + extension));
         }
 
         [TestMethod]

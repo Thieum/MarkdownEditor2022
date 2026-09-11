@@ -1,4 +1,5 @@
 using System.IO;
+using System.Text;
 using System.Threading.Tasks;
 using System.Windows;
 using Microsoft.Web.WebView2.Core;
@@ -31,8 +32,9 @@ namespace MarkdownEditor2022.Services
             {
                 // Build the HTML document from the markdown file
                 string html = HtmlGenerationService.BuildHtmlDocument(markdownFile);
+                html = AddRenderingAssets(html);
 
-                // Write the HTML next to the markdown file so that WebView2 resolves relative
+                // Write the HTML next to the markdown file
                 // resources (images, stylesheets, …) correctly via the same base directory.
                 string markdownDir = Path.GetDirectoryName(markdownFile);
                 tempHtmlFile = Path.Combine(markdownDir, $".export-{Guid.NewGuid():N}.html");
@@ -82,10 +84,12 @@ namespace MarkdownEditor2022.Services
                     throw new InvalidOperationException("Failed to load the HTML content for PDF export.");
                 }
 
-                // Give scripts (Mermaid, Prism, MathJax) a brief moment to render before printing
-                await Task.Delay(300);
+                await WaitForRenderingAsync(webView.CoreWebView2);
 
-                bool printSuccess = await webView.CoreWebView2.PrintToPdfAsync(outputPdfPath);
+                CoreWebView2PrintSettings printSettings = webView.CoreWebView2.Environment.CreatePrintSettings();
+                printSettings.ShouldPrintBackgrounds = true;
+                printSettings.ShouldPrintHeaderAndFooter = false;
+                bool printSuccess = await webView.CoreWebView2.PrintToPdfAsync(outputPdfPath, printSettings);
                 if (!printSuccess)
                 {
                     throw new InvalidOperationException($"PDF export failed. The browser could not write to: {outputPdfPath}");
@@ -101,6 +105,50 @@ namespace MarkdownEditor2022.Services
                     try { File.Delete(tempHtmlFile); } catch { /* best-effort cleanup */ }
                 }
             }
+        }
+
+        private static string AddRenderingAssets(string html)
+        {
+            string margin = Path.Combine(Path.GetDirectoryName(typeof(MarkdownEditor2022Package).Assembly.Location), "Margin");
+            StringBuilder assets = new();
+            assets.Append("<style>");
+            assets.Append(ReadAsset(margin, "prism.css"));
+            assets.Append("</style><script>window.MathJax={tex:{packages:{'[+]':['color']}},loader:{load:['[tex]/color']}};</script>");
+
+            foreach (string file in new[] { "prism.js", "mermaid.min.js", "mathjax.js" })
+            {
+                string source = ReadAsset(margin, file);
+                if (!string.IsNullOrEmpty(source))
+                {
+                    assets.Append("<script>").Append(source.Replace("</script", "<\\/script")).Append("</script>");
+                }
+            }
+
+            assets.Append("<script>(async function(){try{if(window.Prism)Prism.highlightAll();if(window.mermaid){mermaid.initialize({securityLevel:'loose'});await Promise.resolve(mermaid.init(undefined,document.querySelectorAll('.mermaid')));}if(window.MathJax&&MathJax.typesetPromise){await MathJax.typesetPromise();}}catch(e){}window.__markdownEditorReady=true;})();</script>");
+            return html.Replace("</head>", assets.ToString() + "</head>");
+        }
+
+        private static string ReadAsset(string folder, string fileName)
+        {
+            string path = Path.Combine(folder ?? string.Empty, fileName);
+            return File.Exists(path) ? File.ReadAllText(path) : string.Empty;
+        }
+
+        private static async Task WaitForRenderingAsync(CoreWebView2 webView)
+        {
+            for (int i = 0; i < 100; i++)
+            {
+                string ready = await webView.ExecuteScriptAsync(
+                    "document.readyState === 'complete' && window.__markdownEditorReady === true");
+                if (string.Equals(ready, "true", StringComparison.OrdinalIgnoreCase))
+                {
+                    return;
+                }
+
+                await Task.Delay(100);
+            }
+
+            throw new TimeoutException("Timed out waiting for PDF preview rendering to complete.");
         }
     }
 }

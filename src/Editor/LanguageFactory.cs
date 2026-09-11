@@ -36,7 +36,8 @@ namespace MarkdownEditor2022
 
         public override string Name => Constants.LanguageName;
 
-        public override string[] FileExtensions { get; } = [Constants.FileExtensionMd, Constants.FileExtensionRmd];
+        public override string[] FileExtensions { get; } =
+            [Constants.FileExtensionMd, Constants.FileExtensionRmd, Constants.FileExtensionMermaid, Constants.FileExtensionMmd];
 
         public override void SetDefaultPreferences(LanguagePreferences preferences)
         {

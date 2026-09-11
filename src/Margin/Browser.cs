@@ -33,11 +33,15 @@ namespace MarkdownEditor2022
     {
         private readonly string _file;
         private readonly Document _document;
+        private string _previewRoot;
         private readonly IWpfTextView _textView;
         private readonly IEditorFormatMapService _formatMapService;
         private readonly PreviewScrollSync _scrollSync = new();
         private bool _isDisposed;
         private int _currentViewLine;
+        private int _updateVersion;
+        private readonly object _updateCancellationLock = new();
+        private CancellationTokenSource _updateCancellation = new();
         private double _cachedPosition = 0,
                        _cachedHeight = 0,
                        _positionPercentage = 0;
@@ -47,6 +51,12 @@ namespace MarkdownEditor2022
 
         private const string _mappedMarkdownEditorVirtualHostName = "markdown-editor-host";
         private const string _mappedBrowsingFileVirtualHostName = "browsing-file-host";
+        private static readonly HashSet<string> _allowedVisualStudioCommands = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "Edit.GoToAll",
+            "View.SolutionExplorer",
+            "Build.BuildSolution",
+        };
         private static readonly string[] _markdownExtensions = [".md", ".markdown", ".mdown", ".mkd"];
         private static readonly string[] _mermaidExtensions = [".mermaid", ".mmd"];
 
@@ -477,7 +487,16 @@ namespace MarkdownEditor2022
 
         public void Dispose()
         {
-            _isDisposed = true;
+            CancellationTokenSource updateCancellation;
+            lock (_updateCancellationLock)
+            {
+                _isDisposed = true;
+                updateCancellation = _updateCancellation;
+                _updateCancellation = null;
+                updateCancellation?.Cancel();
+            }
+
+            updateCancellation?.Dispose();
             VSColorTheme.ThemeChanged -= OnThemeChanged;
             _browser.Initialized -= BrowserInitialized;
             _browser.NavigationStarting -= BrowserNavigationStarting;
@@ -628,14 +647,14 @@ namespace MarkdownEditor2022
                     _browser.CoreWebView2.SetVirtualHostNameToFolderMapping(_mappedMarkdownEditorVirtualHostName, extensionFolder, CoreWebView2HostResourceAccessKind.Allow);
                 }
 
-                // Map browsing-file-host to the drive root so relative paths with any number of ../ can be resolved
-                // This fixes issue #60 where paths like ../../images/foo.png were being normalized away
-                string driveRoot = Path.GetPathRoot(_file);
+                // Map only the permitted workspace/document root. This preserves ../ links within
+                // the workspace while preventing the preview from exposing the whole drive.
+                _previewRoot = GetPreviewRoot();
                 if (!string.IsNullOrWhiteSpace(_mappedBrowsingFileVirtualHostName) &&
-                    !string.IsNullOrWhiteSpace(driveRoot) &&
-                    Directory.Exists(driveRoot))
+                    !string.IsNullOrWhiteSpace(_previewRoot) &&
+                    Directory.Exists(_previewRoot))
                 {
-                    _browser.CoreWebView2.SetVirtualHostNameToFolderMapping(_mappedBrowsingFileVirtualHostName, driveRoot, CoreWebView2HostResourceAccessKind.Allow);
+                    _browser.CoreWebView2.SetVirtualHostNameToFolderMapping(_mappedBrowsingFileVirtualHostName, _previewRoot, CoreWebView2HostResourceAccessKind.Allow);
                 }
             }
 
@@ -654,6 +673,7 @@ namespace MarkdownEditor2022
                         // Parse not ready yet - render with empty content, will update when parse completes
                     }
 
+                    SetVirtualFolderMapping();
                     MarkdownDocument markdown = _document.Markdown;
                     string html = await RenderMarkdownToHtmlAsync(markdown);
 
@@ -730,6 +750,11 @@ namespace MarkdownEditor2022
                 if (uri.Scheme == "vscmd")
                 {
                     string commandName = (uri.Host + uri.LocalPath).Trim('/');
+                    if (!IsSafeVisualStudioCommand(commandName))
+                    {
+                        return;
+                    }
+
                     try
                     {
                         await VS.Commands.ExecuteAsync(commandName);
@@ -754,22 +779,25 @@ namespace MarkdownEditor2022
                 // Handle browsing-file-host links (resolved absolute paths via virtual host)
                 if (uri.Authority == _mappedBrowsingFileVirtualHostName)
                 {
-                    string driveRoot = Path.GetPathRoot(_file);
-                    if (string.IsNullOrWhiteSpace(driveRoot))
+                    string previewRoot = _previewRoot ?? GetPreviewRoot();
+                    if (!TryResolveVirtualHostPath(uri.LocalPath, previewRoot, out string absolutePath))
                     {
                         return;
                     }
 
-                    string localPath = Uri.UnescapeDataString(uri.LocalPath.TrimStart('/'));
-                    string absolutePath = Path.Combine(driveRoot, localPath.Replace('/', Path.DirectorySeparatorChar));
                     await HandleFileNavigationAsync(absolutePath, uri.Fragment);
                     return;
                 }
 
-                // Handle file:// URLs (absolute paths from resolved relative links)
+                // Handle file:// URLs only when they remain inside the permitted preview root.
                 if (uri.IsAbsoluteUri && uri.Scheme == "file")
                 {
-                    await HandleFileNavigationAsync(uri.LocalPath, uri.Fragment);
+                    string previewRoot = _previewRoot ?? GetPreviewRoot();
+                    if (IsPathWithinPreviewRoot(uri.LocalPath, previewRoot))
+                    {
+                        await HandleFileNavigationAsync(uri.LocalPath, uri.Fragment);
+                    }
+
                     return;
                 }
 
@@ -870,6 +898,52 @@ namespace MarkdownEditor2022
             // File doesn't exist - offer to create it if it's a markdown file
             string currentDir = Path.GetDirectoryName(_file);
             await HandleNonExistentMarkdownLinkAsync(filePath, currentDir);
+        }
+
+        internal static bool IsSafeVisualStudioCommand(string commandName)
+        {
+            return !string.IsNullOrWhiteSpace(commandName) &&
+                   commandName.Length <= 128 &&
+                   commandName.IndexOfAny(new[] { '?', '#', '\\', '/', ':', '\r', '\n', '\0' }) < 0 &&
+                   _allowedVisualStudioCommands.Contains(commandName);
+        }
+
+        internal static bool TryResolveVirtualHostPath(string localPath, string previewRoot, out string absolutePath)
+        {
+            absolutePath = null;
+            if (string.IsNullOrWhiteSpace(localPath) || string.IsNullOrWhiteSpace(previewRoot))
+            {
+                return false;
+            }
+
+            try
+            {
+                absolutePath = ResolvePreviewPath(localPath, previewRoot, previewRoot);
+                return true;
+            }
+            catch (Exception ex) when (ex is ArgumentException || ex is IOException || ex is NotSupportedException || ex is UriFormatException || ex is UnauthorizedAccessException)
+            {
+                return false;
+            }
+        }
+
+        internal static bool IsPathWithinPreviewRoot(string filePath, string previewRoot)
+        {
+            if (string.IsNullOrWhiteSpace(filePath) || string.IsNullOrWhiteSpace(previewRoot))
+            {
+                return false;
+            }
+
+            try
+            {
+                string candidate = Path.GetFullPath(filePath);
+                string boundary = NormalizeBoundary(previewRoot);
+                return candidate.StartsWith(boundary, StringComparison.OrdinalIgnoreCase);
+            }
+            catch (Exception ex) when (ex is ArgumentException || ex is IOException || ex is NotSupportedException)
+            {
+                return false;
+            }
         }
 
         internal static string TryResolveMissingHtmlToMarkdownSibling(string filePath, Func<string, bool> fileExists = null)
@@ -1196,9 +1270,31 @@ namespace MarkdownEditor2022
 
         public async Task UpdateBrowserAsync()
         {
+            CancellationTokenSource updateCancellation = new();
+            lock (_updateCancellationLock)
+            {
+                if (_isDisposed)
+                {
+                    updateCancellation.Dispose();
+                    return;
+                }
+
+                CancellationTokenSource previousUpdate = _updateCancellation;
+                _updateCancellation = updateCancellation;
+                previousUpdate?.Cancel();
+            }
+
+            int updateVersion = Interlocked.Increment(ref _updateVersion);
+            CancellationToken updateToken = updateCancellation.Token;
+
             try
             {
                 await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
+
+                if (_isDisposed || updateToken.IsCancellationRequested)
+                {
+                    return;
+                }
 
                 string html;
 
@@ -1213,7 +1309,8 @@ namespace MarkdownEditor2022
                     // Wait for initial parsing to complete before rendering (fixes #127, #142)
                     // Use a timeout to prevent indefinite waiting
                     using CancellationTokenSource timeoutCts = new(TimeSpan.FromSeconds(10));
-                    await _document.WaitForInitialParseAsync(timeoutCts.Token);
+                    using CancellationTokenSource linkedCts = CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token, updateToken);
+                    await _document.WaitForInitialParseAsync(linkedCts.Token);
 
                     MarkdownDocument markdown = _document.Markdown;
                     if (markdown == null)
@@ -1224,7 +1321,17 @@ namespace MarkdownEditor2022
                     html = await RenderMarkdownToHtmlAsync(markdown);
                 }
 
+                if (updateToken.IsCancellationRequested || updateVersion != Volatile.Read(ref _updateVersion) || _isDisposed)
+                {
+                    return;
+                }
+
                 await UpdateContentAsync(html);
+
+                if (updateToken.IsCancellationRequested || updateVersion != Volatile.Read(ref _updateVersion) || _isDisposed)
+                {
+                    return;
+                }
 
                 // Check for pending cross-document fragment navigation
                 if (!string.IsNullOrWhiteSpace(_file) && _pendingFragmentNavigations.TryRemove(Path.GetFullPath(_file), out string pendingFragment))
@@ -1246,6 +1353,18 @@ namespace MarkdownEditor2022
             catch (Exception ex)
             {
                 await ex.LogAsync();
+            }
+            finally
+            {
+                lock (_updateCancellationLock)
+                {
+                    if (ReferenceEquals(_updateCancellation, updateCancellation))
+                    {
+                        _updateCancellation = null;
+                    }
+                }
+
+                updateCancellation.Dispose();
             }
         }
 
@@ -1332,6 +1451,48 @@ namespace MarkdownEditor2022
         // Pre-computed virtual host URL prefix to avoid repeated string concatenation
         private const string _virtualHostUrlPrefix = "http://" + _mappedBrowsingFileVirtualHostName + "/";
 
+        private string GetPreviewRoot()
+        {
+            string documentDirectory = Path.GetDirectoryName(_file);
+            string configured = ResolveConfiguredRootPath(GetEffectiveRootPath(_document.Markdown), documentDirectory);
+            return GetPreviewRoot(documentDirectory, configured);
+        }
+
+        private static string GetPreviewRoot(string documentDirectory, string configuredRoot)
+        {
+            if (!string.IsNullOrWhiteSpace(configuredRoot) && Directory.Exists(configuredRoot))
+            {
+                return Path.GetFullPath(configuredRoot);
+            }
+
+            DirectoryInfo directory = string.IsNullOrWhiteSpace(documentDirectory) ? null : new DirectoryInfo(documentDirectory);
+            while (directory != null)
+            {
+                if (directory.GetFiles("*.sln").Length > 0 || directory.GetFiles("*.slnx").Length > 0 ||
+                    directory.GetFiles("*.csproj").Length > 0 || Directory.Exists(Path.Combine(directory.FullName, ".git")))
+                {
+                    return directory.FullName;
+                }
+
+                directory = directory.Parent;
+            }
+
+            return documentDirectory;
+        }
+
+        private static string ResolveConfiguredRootPath(string configuredRoot, string documentDirectory)
+        {
+            if (string.IsNullOrWhiteSpace(configuredRoot))
+            {
+                return null;
+            }
+
+            string decoded = configuredRoot.Trim().Trim('"', '\'');
+            return Path.GetFullPath(Path.IsPathRooted(decoded)
+                ? decoded
+                : Path.Combine(documentDirectory ?? string.Empty, decoded));
+        }
+
         /// <summary>
         /// Resolves relative paths in HTML src and href attributes to absolute virtual host URLs.
         /// This fixes issue #60 where paths with parent directory navigation (../) were being
@@ -1358,9 +1519,10 @@ namespace MarkdownEditor2022
                 return html;
             }
 
-            string driveRoot = Path.GetPathRoot(baseDirectory);
+            rootPath = ResolveConfiguredRootPath(rootPath, baseDirectory);
+            string previewRoot = GetPreviewRoot(baseDirectory, rootPath);
 
-            // First, handle root-relative paths (starting with /) if rootPath is specified
+            // First, handle root-relative paths
             if (!string.IsNullOrEmpty(rootPath))
             {
                 html = _rootRelativePathRegex.Replace(html, match =>
@@ -1376,7 +1538,7 @@ namespace MarkdownEditor2022
 
                     try
                     {
-                        return ResolveRootRelativePath(attr, relativePath, rootPath, driveRoot);
+                        return ResolveRootRelativePath(attr, relativePath, rootPath, previewRoot);
                     }
                     catch
                     {
@@ -1400,7 +1562,7 @@ namespace MarkdownEditor2022
 
                 try
                 {
-                    return ResolveRelativePath(attr, relativePath, baseDirectory, driveRoot);
+                    return ResolveRelativePath(attr, relativePath, baseDirectory, previewRoot);
                 }
                 catch
                 {
@@ -1413,48 +1575,48 @@ namespace MarkdownEditor2022
         }
 
         /// <summary>Resolves a regular relative path to a virtual host URL attribute string.</summary>
-        internal static string ResolveRelativePath(string attr, string relativePath, string baseDirectory, string driveRoot)
+        internal static string ResolveRelativePath(string attr, string relativePath, string baseDirectory, string previewRoot)
         {
-            string decodedPath = relativePath.IndexOf('%') >= 0
-                ? WebUtility.UrlDecode(relativePath)
-                : relativePath;
-
-            // Normalize path separators
-            decodedPath = decodedPath.Replace('/', Path.DirectorySeparatorChar);
-
-            // Resolve the full path using Path.GetFullPath which handles ../ correctly
-            string fullPath = Path.GetFullPath(Path.Combine(baseDirectory, decodedPath));
-
-            // Convert to virtual host URL relative to drive root
-            // e.g., C:\Projects\images\foo.png -> http://browsing-file-host/Projects/images/foo.png
-            string relativeToDrive = fullPath.StartsWith(driveRoot, StringComparison.OrdinalIgnoreCase)
-                ? fullPath.Substring(driveRoot.Length)
-                : fullPath;
-
-            return string.Concat(attr, "=\"", _virtualHostUrlPrefix, relativeToDrive.Replace(Path.DirectorySeparatorChar, '/'), "\"");
+            string fullPath = ResolvePreviewPath(relativePath, baseDirectory, previewRoot);
+            return ToVirtualHostAttribute(attr, fullPath, previewRoot);
         }
 
         /// <summary>Resolves a root-relative path (starting with /) to a virtual host URL attribute string.</summary>
-        internal static string ResolveRootRelativePath(string attr, string relativePath, string rootPath, string driveRoot)
+        internal static string ResolveRootRelativePath(string attr, string relativePath, string rootPath, string previewRoot)
         {
-            // Only decode if path contains encoded characters (avoid allocation otherwise)
-            string decodedPath = relativePath.IndexOf('%') >= 0
-                ? WebUtility.UrlDecode(relativePath)
-                : relativePath;
+            string fullPath = ResolvePreviewPath(relativePath, rootPath, previewRoot);
+            return ToVirtualHostAttribute(attr, fullPath, previewRoot);
+        }
 
-            // Remove leading slash and normalize path separators
-            string pathWithoutLeadingSlash = decodedPath.TrimStart('/');
-            pathWithoutLeadingSlash = pathWithoutLeadingSlash.Replace('/', Path.DirectorySeparatorChar);
+        private static string ResolvePreviewPath(string path, string baseDirectory, string previewRoot)
+        {
+            if (string.IsNullOrWhiteSpace(baseDirectory) || string.IsNullOrWhiteSpace(previewRoot))
+            {
+                throw new InvalidOperationException("Preview path has no permitted root.");
+            }
 
-            // Resolve against the root path
-            string fullPath = Path.GetFullPath(Path.Combine(rootPath, pathWithoutLeadingSlash));
+            string decoded = path.IndexOf('%') >= 0 ? WebUtility.UrlDecode(path) : path;
+            decoded = decoded.TrimStart('/').Replace('/', Path.DirectorySeparatorChar);
+            string candidate = Path.GetFullPath(Path.Combine(baseDirectory, decoded));
+            string boundary = NormalizeBoundary(previewRoot);
+            if (!candidate.StartsWith(boundary, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new UnauthorizedAccessException("Preview path is outside the permitted root.");
+            }
 
-            // Convert to virtual host URL relative to drive root
-            string relativeToDrive = fullPath.StartsWith(driveRoot, StringComparison.OrdinalIgnoreCase)
-                ? fullPath.Substring(driveRoot.Length)
-                : fullPath;
+            return candidate;
+        }
 
-            return string.Concat(attr, "=\"", _virtualHostUrlPrefix, relativeToDrive.Replace(Path.DirectorySeparatorChar, '/'), "\"");
+        private static string ToVirtualHostAttribute(string attr, string fullPath, string previewRoot)
+        {
+            string boundary = NormalizeBoundary(previewRoot);
+            string relative = fullPath.Substring(boundary.Length).Replace(Path.DirectorySeparatorChar, '/');
+            return string.Concat(attr, "=\"", _virtualHostUrlPrefix, relative, "\"");
+        }
+
+        private static string NormalizeBoundary(string root)
+        {
+            return Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
         }
 
         /// <summary>
@@ -1464,9 +1626,9 @@ namespace MarkdownEditor2022
         /// <param name="css">The CSS content with potentially relative url() paths.</param>
         /// <param name="cssDirectory">The directory containing the CSS file.</param>
         /// <returns>CSS with relative url() paths converted to absolute virtual host URLs.</returns>
-        private static string ResolveCssUrls(string css, string cssDirectory)
+        private static string ResolveCssUrls(string css, string cssDirectory, string previewRoot)
         {
-            if (string.IsNullOrEmpty(css) || string.IsNullOrEmpty(cssDirectory))
+            if (string.IsNullOrEmpty(css) || string.IsNullOrEmpty(cssDirectory) || string.IsNullOrEmpty(previewRoot))
             {
                 return css;
             }
@@ -1476,8 +1638,6 @@ namespace MarkdownEditor2022
             {
                 return css;
             }
-
-            string driveRoot = Path.GetPathRoot(cssDirectory);
 
             return _cssUrlRegex.Replace(css, match =>
             {
@@ -1499,15 +1659,10 @@ namespace MarkdownEditor2022
                     // Normalize path separators for Path.Combine
                     string normalizedPath = decodedPath.Replace('/', Path.DirectorySeparatorChar);
 
-                    // Resolve relative path against CSS directory
-                    string fullPath = Path.GetFullPath(Path.Combine(cssDirectory, normalizedPath));
-
-                    // Get path relative to drive root for virtual host mapping
-                    string relativeToDrive = fullPath.StartsWith(driveRoot, StringComparison.OrdinalIgnoreCase)
-                        ? fullPath.Substring(driveRoot.Length)
-                        : fullPath;
-
-                    string absoluteUrl = _virtualHostUrlPrefix + relativeToDrive.Replace(Path.DirectorySeparatorChar, '/');
+                    string fullPath = ResolvePreviewPath(normalizedPath, cssDirectory, previewRoot);
+                    string boundary = NormalizeBoundary(previewRoot);
+                    string virtualRelativePath = fullPath.Substring(boundary.Length).Replace(Path.DirectorySeparatorChar, '/');
+                    string absoluteUrl = _virtualHostUrlPrefix + virtualRelativePath;
                     return string.Concat("url(\"", absoluteUrl, "\")");
                 }
                 catch
@@ -1635,7 +1790,7 @@ namespace MarkdownEditor2022
                 // Resolve relative url() paths in custom CSS files (e.g., font-face references)
                 if (usingCustomHighlight)
                 {
-                    cssHighlight = ResolveCssUrls(cssHighlight, Path.GetDirectoryName(highlightSourcePath));
+                    cssHighlight = ResolveCssUrls(cssHighlight, Path.GetDirectoryName(highlightSourcePath), GetPreviewRoot());
                 }
 
                 string cssPrism = GetPrismCss(useLightTheme, prismSourcePath);

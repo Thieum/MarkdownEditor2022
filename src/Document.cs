@@ -18,7 +18,8 @@ namespace MarkdownEditor2022
         private readonly SemaphoreSlim _parseSemaphore = new(1, 1);
         private CancellationTokenSource _parseCts = new();
         private readonly CancellationTokenSource _disposalTokenSource = new();
-        private readonly TaskCompletionSource<bool> _initialParseCompletionSource = new();
+        private readonly TaskCompletionSource<bool> _initialParseCompletionSource = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly object _parseCancellationLock = new();
         private bool _isDisposed;
         private string _lastParsedText;
         private int _lastParsedVersion;
@@ -94,11 +95,23 @@ namespace MarkdownEditor2022
                 return;
             }
 
-            // Cancel any in-flight parse (we will ignore its result if already running)
-            _parseCts.Cancel();
-            _parseCts.Dispose();
-            _parseCts = new CancellationTokenSource();
-            CancellationToken localToken = _parseCts.Token;
+            // Cancel any in-flight parse (we will ignore its result if already running).
+            // Keep cancelled sources undisposed until their parse has exited to avoid racing
+            // token access during rapid edits or disposal.
+            CancellationTokenSource localCts;
+            CancellationToken localToken;
+            lock (_parseCancellationLock)
+            {
+                if (_isDisposed)
+                {
+                    return;
+                }
+
+                _parseCts?.Cancel();
+                localCts = new CancellationTokenSource();
+                _parseCts = localCts;
+                localToken = localCts.Token;
+            }
 
             // Use semaphore to prevent multiple concurrent parsing operations.
             // Always wait for the semaphore so parse requests are queued instead of dropped,
@@ -109,13 +122,15 @@ namespace MarkdownEditor2022
             }
             catch (OperationCanceledException)
             {
+                ReleaseParseCancellationSource(localCts);
                 return;
             }
 
-            int snapshotVersion = _buffer.CurrentSnapshot.Version.VersionNumber;
+            bool semaphoreAcquired = false;
 
             try
             {
+                semaphoreAcquired = true;
                 IsParsing = true;
                 bool success = false;
 
@@ -128,7 +143,10 @@ namespace MarkdownEditor2022
                         return;
                     }
 
-                    ITextSnapshot snapshot = _buffer.CurrentSnapshot; // capture snapshot
+                    // Capture the snapshot and its version after switching threads so the
+                    // version corresponds to the exact text being parsed.
+                    ITextSnapshot snapshot = _buffer.CurrentSnapshot;
+                    int snapshotVersion = snapshot.Version.VersionNumber;
                     string text = snapshot.GetText();
 
                     // Skip parsing if text hasn't changed based on snapshot version & content
@@ -172,18 +190,40 @@ namespace MarkdownEditor2022
                 {
                     IsParsing = false;
 
-                    if (success && !localToken.IsCancellationRequested)
+                    if (!localToken.IsCancellationRequested)
                     {
-                        // Signal that initial parsing is complete (only sets once, subsequent calls are ignored)
+                        // Complete the initial wait even when parsing fails; consumers can inspect Markdown.
                         _initialParseCompletionSource.TrySetResult(true);
-                        Parsed?.Invoke(this);
+
+                        if (success)
+                        {
+                            Parsed?.Invoke(this);
+                        }
                     }
                 }
             }
             finally
             {
-                _parseSemaphore.Release();
+                if (semaphoreAcquired)
+                {
+                    _parseSemaphore.Release();
+                }
+
+                ReleaseParseCancellationSource(localCts);
             }
+        }
+
+        private void ReleaseParseCancellationSource(CancellationTokenSource localCts)
+        {
+            lock (_parseCancellationLock)
+            {
+                if (ReferenceEquals(_parseCts, localCts))
+                {
+                    _parseCts = null;
+                }
+            }
+
+            localCts.Dispose();
         }
 
         private static DocumentAnalysis BuildAnalysis(MarkdownDocument md)
@@ -236,18 +276,23 @@ namespace MarkdownEditor2022
 
         public void Dispose()
         {
-            if (!_isDisposed)
+            lock (_parseCancellationLock)
             {
-                _buffer.Changed -= BufferChanged;
-                AdvancedOptions.Saved -= AdvancedOptionsSaved;
-                _disposalTokenSource.Cancel();
-                _disposalTokenSource.Dispose();
-                _parseCts.Cancel();
-                _parseCts.Dispose();
-                _parseSemaphore.Dispose();
+                if (_isDisposed)
+                {
+                    return;
+                }
+
+                _isDisposed = true;
+                _parseCts?.Cancel();
             }
 
-            _isDisposed = true;
+            _buffer.Changed -= BufferChanged;
+            AdvancedOptions.Saved -= AdvancedOptionsSaved;
+            _disposalTokenSource.Cancel();
+            // The source may still be observed by an in-flight WaitAsync continuation.
+            // Let it be reclaimed with the document instead of disposing it during teardown.
+            _initialParseCompletionSource.TrySetCanceled();
         }
 
         public event Action<Document> Parsed;
