@@ -144,10 +144,10 @@
     <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.3485.44" />
   </ItemGroup>
 
-  <!-- Include Markdig transitive dependencies (System.Memory, etc.) in the VSIX container -->
+  <!-- Include Markdig and its transitive dependencies in the VSIX container. -->
   <Target Name="IncludeMarkdigDependencies" AfterTargets="GetVsixSourceItems">
     <ItemGroup>
-      <VSIXSourceItem Include="@(ReferenceCopyLocalPaths)" Condition="'%(ReferenceCopyLocalPaths.NuGetPackageId)' == 'System.Memory'&#xD;&#xA;                                  or '%(ReferenceCopyLocalPaths.NuGetPackageId)' == 'System.Buffers'&#xD;&#xA;                                  or '%(ReferenceCopyLocalPaths.NuGetPackageId)' == 'System.Numerics.Vectors'&#xD;&#xA;                                  or '%(ReferenceCopyLocalPaths.NuGetPackageId)' == 'System.Runtime.CompilerServices.Unsafe'" />
+      <VSIXSourceItem Include="@(ReferenceCopyLocalPaths)" Condition="'%(ReferenceCopyLocalPaths.NuGetPackageId)' == 'Markdig'&#xD;&#xA;                                  or '%(ReferenceCopyLocalPaths.NuGetPackageId)' == 'System.Memory'&#xD;&#xA;                                  or '%(ReferenceCopyLocalPaths.NuGetPackageId)' == 'System.Buffers'&#xD;&#xA;                                  or '%(ReferenceCopyLocalPaths.NuGetPackageId)' == 'System.Numerics.Vectors'&#xD;&#xA;                                  or '%(ReferenceCopyLocalPaths.NuGetPackageId)' == 'System.Runtime.CompilerServices.Unsafe'" />
     </ItemGroup>
   </Target>
 

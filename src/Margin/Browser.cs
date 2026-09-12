@@ -1747,8 +1747,7 @@ namespace MarkdownEditor2022
         html, body {{background-color: {themeBgColor}; color: {themeFgColor};}}
         .markdown-body {{background-color: {themeBgColor}; color: {themeFgColor};}}";
 
-                string defaultHeadBeg = $@"
-<head>
+                string previewHeadContent = $@"
     <meta http-equiv=""X-UA-Compatible"" content=""IE=Edge"" />
     <meta charset=""utf-8"" />
     <style>
@@ -1773,8 +1772,7 @@ namespace MarkdownEditor2022
     ";
                 string clickSyncScript = clickSync ? GetClickToSyncScript() : string.Empty;
                 string bodyStyle = usingCustomHighlight ? string.Empty : $" style=\"background-color:{themeBgColor};color:{themeFgColor}\"";
-                string processed = templateRaw
-                    .Replace("<head>", defaultHeadBeg)
+                string processed = InjectPreviewHead(templateRaw, previewHeadContent)
                     .Replace("[content]", defaultContent)
                     .Replace("[title]", "Markdown Preview")
                     .Replace("<body>", $"<body{bodyStyle}>")
@@ -1823,6 +1821,32 @@ namespace MarkdownEditor2022
             {
                 try { return File.GetLastWriteTimeUtc(path); } catch { return DateTime.MinValue; }
             }
+        }
+
+        internal static string InjectPreviewHead(string template, string content)
+        {
+            int headStart = template.IndexOf("<head", StringComparison.OrdinalIgnoreCase);
+            if (headStart >= 0)
+            {
+                int headEnd = template.IndexOf('>', headStart);
+                if (headEnd >= 0)
+                {
+                    return template.Insert(headEnd + 1, content);
+                }
+            }
+
+            string head = $"<head>{content}</head>";
+            int htmlStart = template.IndexOf("<html", StringComparison.OrdinalIgnoreCase);
+            if (htmlStart >= 0)
+            {
+                int htmlEnd = template.IndexOf('>', htmlStart);
+                if (htmlEnd >= 0)
+                {
+                    return template.Insert(htmlEnd + 1, head);
+                }
+            }
+
+            return head + template;
         }
 
         private static string GetScrollbarColor(bool useLightTheme)

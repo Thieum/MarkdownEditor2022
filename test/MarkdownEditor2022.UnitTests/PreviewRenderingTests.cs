@@ -35,6 +35,24 @@ namespace MarkdownEditor2022.UnitTests
         }
 
         [TestMethod]
+        public void InjectPreviewHead_TemplateWithoutHead_AddsStylesBeforeBody()
+        {
+            string result = Browser.InjectPreviewHead("<html><body>profile-[content]</body></html>", "<style>#probe { color: red; }</style>");
+
+            Assert.AreEqual(
+                "<html><head><style>#probe { color: red; }</style></head><body>profile-[content]</body></html>",
+                result);
+        }
+
+        [TestMethod]
+        public void InjectPreviewHead_ExistingHead_PreservesExistingContent()
+        {
+            string result = Browser.InjectPreviewHead("<html><HEAD data-test=\"true\"><title>Custom</title></HEAD><body></body></html>", "<style>body { color: red; }</style>");
+
+            StringAssert.Contains(result, "<HEAD data-test=\"true\"><style>body { color: red; }</style><title>Custom</title></HEAD>");
+        }
+
+        [TestMethod]
         public async Task PreviewContentScript_NodeBehaviorTestsPass()
         {
             string outputDirectory = AppContext.BaseDirectory;
