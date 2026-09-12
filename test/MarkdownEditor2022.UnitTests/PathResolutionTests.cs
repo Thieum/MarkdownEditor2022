@@ -414,6 +414,37 @@ namespace MarkdownEditor2022.UnitTests
         }
 
         [TestMethod]
+        public void BrowserResolveRootRelativePath_DiscoversNearestMatchingAncestor()
+        {
+            string workspaceRoot = Path.Combine(Path.GetTempPath(), "MarkdownPreviewRoot", Guid.NewGuid().ToString("N"));
+            string siteRoot = Path.Combine(workspaceRoot, "docs");
+            string documentDirectory = Path.Combine(siteRoot, "automation", "climate");
+            string imageDirectory = Path.Combine(siteRoot, "assets", "img");
+            Directory.CreateDirectory(documentDirectory);
+            Directory.CreateDirectory(imageDirectory);
+            File.WriteAllText(Path.Combine(imageDirectory, "purifier.svg"), "<svg />");
+
+            try
+            {
+                string html = Browser.ResolveRelativePathsToAbsoluteUrls(
+                    "<img src=\"/assets/img/purifier.svg\">",
+                    documentDirectory,
+                    previewRoot: workspaceRoot);
+
+                Assert.AreEqual(
+                    siteRoot,
+                    Browser.FindRootPath("/assets/img/purifier.svg", documentDirectory, workspaceRoot));
+                Assert.AreEqual(
+                    "<img src=\"http://browsing-file-host/docs/assets/img/purifier.svg\">",
+                    html);
+            }
+            finally
+            {
+                Directory.Delete(workspaceRoot, recursive: true);
+            }
+        }
+
+        [TestMethod]
         public void BrowserTryResolveVirtualHostPath_RejectsTraversalOutsidePreviewRoot()
         {
             bool resolved = Browser.TryResolveVirtualHostPath(

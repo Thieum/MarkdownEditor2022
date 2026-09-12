@@ -1433,7 +1433,7 @@ namespace MarkdownEditor2022
         /// <param name="baseDirectory">The directory to resolve relative paths against.</param>
         /// <param name="rootPath">Optional root path from front matter or .editorconfig for resolving root-relative paths (paths starting with /).</param>
         /// <returns>HTML with relative paths converted to absolute virtual host URLs.</returns>
-        private static string ResolveRelativePathsToAbsoluteUrls(string html, string baseDirectory, string rootPath = null, string previewRoot = null)
+        internal static string ResolveRelativePathsToAbsoluteUrls(string html, string baseDirectory, string rootPath = null, string previewRoot = null)
         {
             if (string.IsNullOrEmpty(html) || string.IsNullOrEmpty(baseDirectory))
             {
@@ -1452,30 +1452,30 @@ namespace MarkdownEditor2022
             previewRoot ??= GetPreviewRoot(baseDirectory, rootPath);
 
             // First, handle root-relative paths
-            if (!string.IsNullOrEmpty(rootPath))
+            html = _rootRelativePathRegex.Replace(html, match =>
             {
-                html = _rootRelativePathRegex.Replace(html, match =>
+                string attr = match.Groups["attr"].Value;
+                string relativePath = match.Groups["path"].Value;
+
+                // Skip if it's an anchor-only link
+                if (string.IsNullOrEmpty(relativePath) || relativePath == "/")
                 {
-                    string attr = match.Groups["attr"].Value;
-                    string relativePath = match.Groups["path"].Value;
+                    return match.Value;
+                }
 
-                    // Skip if it's an anchor-only link
-                    if (string.IsNullOrEmpty(relativePath) || relativePath == "/")
-                    {
-                        return match.Value;
-                    }
-
-                    try
-                    {
-                        return ResolveRootRelativePath(attr, relativePath, rootPath, previewRoot);
-                    }
-                    catch
-                    {
-                        // If path resolution fails, keep the original path
-                        return match.Value;
-                    }
-                });
-            }
+                try
+                {
+                    string effectiveRoot = rootPath ?? FindRootPath(relativePath, baseDirectory, previewRoot);
+                    return string.IsNullOrEmpty(effectiveRoot)
+                        ? match.Value
+                        : ResolveRootRelativePath(attr, relativePath, effectiveRoot, previewRoot);
+                }
+                catch
+                {
+                    // If path resolution fails, keep the original path
+                    return match.Value;
+                }
+            });
 
             // Then handle regular relative paths (not starting with /)
             html = _relativePathRegex.Replace(html, match =>
@@ -1501,6 +1501,30 @@ namespace MarkdownEditor2022
             });
 
             return html;
+        }
+
+        internal static string FindRootPath(string rootRelativePath, string documentDirectory, string previewRoot)
+        {
+            if (string.IsNullOrWhiteSpace(rootRelativePath) ||
+                string.IsNullOrWhiteSpace(documentDirectory) ||
+                string.IsNullOrWhiteSpace(previewRoot))
+            {
+                return null;
+            }
+
+            DirectoryInfo directory = new(Path.GetFullPath(documentDirectory));
+            while (directory != null && IsPathWithinPreviewRoot(directory.FullName, previewRoot))
+            {
+                string candidate = ResolvePreviewPath(rootRelativePath, directory.FullName, previewRoot);
+                if (File.Exists(candidate) || Directory.Exists(candidate))
+                {
+                    return directory.FullName;
+                }
+
+                directory = directory.Parent;
+            }
+
+            return null;
         }
 
         /// <summary>Resolves a regular relative path to a virtual host URL attribute string.</summary>
