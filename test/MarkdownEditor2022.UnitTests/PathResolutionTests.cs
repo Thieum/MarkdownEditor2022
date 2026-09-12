@@ -349,6 +349,28 @@ namespace MarkdownEditor2022.UnitTests
         }
 
         [TestMethod]
+        public void BrowserGetPreviewRoot_WorkspaceAllowsDeepParentTraversalWithinRoot()
+        {
+            string result = Browser.GetPreviewRoot(
+                @"C:\Solution\docs\release\content", configuredRoot: null, @"C:\Solution");
+
+            Assert.AreEqual(@"C:\Solution", result);
+            Assert.AreEqual(
+                "src=\"http://browsing-file-host/shared/image.png\"",
+                Browser.ResolveRelativePath(
+                    "src", "../../../shared/image.png", @"C:\Solution\docs\release\content", result));
+        }
+
+        [TestMethod]
+        public void BrowserGetPreviewRoot_DocumentAtWorkspaceRoot_UsesWorkspaceRoot()
+        {
+            string result = Browser.GetPreviewRoot(
+                @"C:\Solution", configuredRoot: null, @"C:\Solution");
+
+            Assert.AreEqual(@"C:\Solution", result);
+        }
+
+        [TestMethod]
         public void BrowserGetPreviewRoot_MiscellaneousFile_AllowsSiblingAssetDirectory()
         {
             string root = Path.Combine(Path.GetTempPath(), "MarkdownPreviewRoot", Guid.NewGuid().ToString("N"));
@@ -401,6 +423,7 @@ namespace MarkdownEditor2022.UnitTests
         }
 
         [DataRow(@"C:\Projects\Wiki\docs\page.md", true)]
+        [DataRow(@"C:\Projects\Wiki", true)]
         [DataRow(@"C:\Projects\Wiki2\secret.md", false)]
         [DataRow(@"C:\Secrets\credentials.txt", false)]
         [TestMethod]

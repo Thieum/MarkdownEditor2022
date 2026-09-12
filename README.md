@@ -211,8 +211,19 @@ In these examples:
 - Supports Windows paths (`C:\Projects\blog`) and Unix paths (`/home/user/website`)
 - Case-insensitive (`root_path` or `ROOT_PATH` in front matter)
 - Can be quoted if the path contains spaces: `root_path: "C:\My Projects\Site"`
-- Regular relative paths (not starting with `/`) continue to work as before
+- Regular relative paths (not starting with `/`) can use `..` while remaining within the preview root
 - Paths starting with `<http://`,> `<https://`,> `data:`, or `#` are left unchanged
+
+#### Preview path boundaries
+
+For security, local images and links are rendered only when their resolved paths remain within the preview root. The preview root is selected in this order:
+
+1. The `root_path` front matter or `md_root_path` EditorConfig setting.
+2. The loaded solution directory or Open Folder root.
+3. The nearest ancestor containing `.git`, a solution file, or a project file.
+4. For a standalone file under **Miscellaneous Files**, the parent of the Markdown file's directory.
+
+Relative references can traverse any number of parent directories as long as they remain inside that root. For example, `../../../shared/image.png` works when `shared` is still within the loaded solution or Open Folder root. A standalone Miscellaneous File supports one parent level by default; configure `root_path` or `md_root_path` to allow references from a higher common root. References that escape the preview root are left unresolved.
 
 **Typical Jekyll structure:**
 

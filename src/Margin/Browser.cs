@@ -52,6 +52,7 @@ namespace MarkdownEditor2022
         private string _lastRenderedHtml;
         private MarkdownDocument _lastRenderedMarkdown;
         private string _resolvedRootSetting;
+        private string _resolvedWorkspaceRoot;
         private bool _rootResolved;
         private double _cachedPosition = 0,
                        _cachedHeight = 0,
@@ -777,8 +778,10 @@ namespace MarkdownEditor2022
             try
             {
                 string candidate = Path.GetFullPath(filePath);
+                string root = Path.GetFullPath(previewRoot).TrimEnd(Path.DirectorySeparatorChar);
                 string boundary = NormalizeBoundary(previewRoot);
-                return candidate.StartsWith(boundary, StringComparison.OrdinalIgnoreCase);
+                return candidate.Equals(root, StringComparison.OrdinalIgnoreCase) ||
+                       candidate.StartsWith(boundary, StringComparison.OrdinalIgnoreCase);
             }
             catch (Exception ex) when (ex is ArgumentException || ex is IOException || ex is NotSupportedException)
             {
@@ -1332,16 +1335,18 @@ namespace MarkdownEditor2022
             await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync(cancellationToken);
             string documentDirectory = Path.GetDirectoryName(_file);
             IVsSolution solution = await VS.GetRequiredServiceAsync<SVsSolution, IVsSolution>();
-            string openFolderRoot = GetOpenFolderRoot(solution);
+            string workspaceRoot = GetWorkspaceRoot(solution);
             string editorConfigRoot = RootPathResolver.GetRootPathFromEditorConfig(_textView);
             string rootPath = await Task.Run(() =>
                 RootPathResolver.GetRootPathFromFrontMatter(markdown) ?? editorConfigRoot, cancellationToken);
             string configured = ResolveConfiguredRootPath(rootPath, documentDirectory);
 
-            if (!_rootResolved || !string.Equals(configured, _resolvedRootSetting, StringComparison.OrdinalIgnoreCase))
+            if (!_rootResolved ||
+                !string.Equals(configured, _resolvedRootSetting, StringComparison.OrdinalIgnoreCase) ||
+                !string.Equals(workspaceRoot, _resolvedWorkspaceRoot, StringComparison.OrdinalIgnoreCase))
             {
                 string previewRoot = await Task.Run(
-                    () => GetPreviewRoot(documentDirectory, configured, openFolderRoot), cancellationToken);
+                    () => GetPreviewRoot(documentDirectory, configured, workspaceRoot), cancellationToken);
                 cancellationToken.ThrowIfCancellationRequested();
                 if (!string.IsNullOrEmpty(previewRoot) && !string.Equals(previewRoot, _previewRoot, StringComparison.OrdinalIgnoreCase))
                 {
@@ -1352,17 +1357,20 @@ namespace MarkdownEditor2022
 
                 _previewRoot = previewRoot;
                 _resolvedRootSetting = configured;
+                _resolvedWorkspaceRoot = workspaceRoot;
                 _rootResolved = true;
             }
 
             return rootPath;
         }
 
-        private static string GetOpenFolderRoot(IVsSolution solution)
+        private static string GetWorkspaceRoot(IVsSolution solution)
         {
             ErrorHandler.ThrowOnFailure(solution.GetProperty(
                 (int)__VSPROPID7.VSPROPID_IsInOpenFolderMode, out object openFolderMode));
-            if (openFolderMode is not bool isOpenFolder || !isOpenFolder)
+            ErrorHandler.ThrowOnFailure(solution.GetProperty(
+                (int)__VSPROPID.VSPROPID_IsSolutionOpen, out object solutionOpen));
+            if (openFolderMode is not true && solutionOpen is not true)
             {
                 return null;
             }
@@ -1372,16 +1380,16 @@ namespace MarkdownEditor2022
             return solutionDirectory;
         }
 
-        internal static string GetPreviewRoot(string documentDirectory, string configuredRoot, string openFolderRoot = null)
+        internal static string GetPreviewRoot(string documentDirectory, string configuredRoot, string workspaceRoot = null)
         {
             if (!string.IsNullOrWhiteSpace(configuredRoot) && Directory.Exists(configuredRoot))
             {
                 return Path.GetFullPath(configuredRoot);
             }
 
-            if (IsPathWithinPreviewRoot(documentDirectory, openFolderRoot))
+            if (IsPathWithinPreviewRoot(documentDirectory, workspaceRoot))
             {
-                return Path.GetFullPath(openFolderRoot);
+                return Path.GetFullPath(workspaceRoot);
             }
 
             DirectoryInfo documentFolder = string.IsNullOrWhiteSpace(documentDirectory) ? null : new DirectoryInfo(documentDirectory);
