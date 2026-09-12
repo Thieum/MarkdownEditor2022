@@ -336,6 +336,53 @@ namespace MarkdownEditor2022.UnitTests
         }
 
         [TestMethod]
+        public void BrowserGetPreviewRoot_OpenFolder_AllowsSiblingAssetDirectory()
+        {
+            string result = Browser.GetPreviewRoot(
+                @"C:\What's New\18.12\content", configuredRoot: null, @"C:\What's New\18.12");
+
+            Assert.AreEqual(@"C:\What's New\18.12", result);
+            Assert.AreEqual(
+                "src=\"http://browsing-file-host/media/copy-commit-id.png\"",
+                Browser.ResolveRelativePath(
+                    "src", "../media/copy-commit-id.png", @"C:\What's New\18.12\content", result));
+        }
+
+        [TestMethod]
+        public void BrowserGetPreviewRoot_MiscellaneousFile_AllowsSiblingAssetDirectory()
+        {
+            string root = Path.Combine(Path.GetTempPath(), "MarkdownPreviewRoot", Guid.NewGuid().ToString("N"));
+            string content = Path.Combine(root, "content");
+            Directory.CreateDirectory(content);
+            Directory.CreateDirectory(Path.Combine(root, "media"));
+            try
+            {
+                string result = Browser.GetPreviewRoot(content, configuredRoot: null);
+
+                Assert.AreEqual(root, result);
+                Assert.AreEqual(
+                    "src=\"http://browsing-file-host/media/copy-commit-id.png\"",
+                    Browser.ResolveRelativePath("src", "../media/copy-commit-id.png", content, result));
+            }
+            finally
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+
+        [TestMethod]
+        public void BrowserGetPreviewRoot_IgnoresOpenFolderThatDoesNotContainDocument()
+        {
+            string documentDirectory = AppContext.BaseDirectory;
+            string unrelatedOpenFolder = Path.GetTempPath();
+            string result = Browser.GetPreviewRoot(
+                documentDirectory, configuredRoot: null, unrelatedOpenFolder);
+
+            Assert.AreNotEqual(Path.GetFullPath(unrelatedOpenFolder), result);
+            Assert.IsTrue(Browser.IsPathWithinPreviewRoot(documentDirectory, result));
+        }
+
+        [TestMethod]
         public void BrowserResolveRootRelativePath_UsesConfiguredRootPath()
         {
             string result = Browser.ResolveRootRelativePath(

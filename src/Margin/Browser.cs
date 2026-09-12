@@ -18,7 +18,9 @@ using System.Windows.Media;
 using Markdig.Extensions.Yaml;
 using Markdig.Renderers;
 using Markdig.Syntax;
+using Microsoft.VisualStudio;
 using Microsoft.VisualStudio.PlatformUI;
+using Microsoft.VisualStudio.Shell.Interop;
 using Microsoft.VisualStudio.Text;
 using Microsoft.VisualStudio.Text.Classification;
 using Microsoft.VisualStudio.Text.Editor;
@@ -1329,6 +1331,8 @@ namespace MarkdownEditor2022
         {
             await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync(cancellationToken);
             string documentDirectory = Path.GetDirectoryName(_file);
+            IVsSolution solution = await VS.GetRequiredServiceAsync<SVsSolution, IVsSolution>();
+            string openFolderRoot = GetOpenFolderRoot(solution);
             string editorConfigRoot = RootPathResolver.GetRootPathFromEditorConfig(_textView);
             string rootPath = await Task.Run(() =>
                 RootPathResolver.GetRootPathFromFrontMatter(markdown) ?? editorConfigRoot, cancellationToken);
@@ -1336,7 +1340,8 @@ namespace MarkdownEditor2022
 
             if (!_rootResolved || !string.Equals(configured, _resolvedRootSetting, StringComparison.OrdinalIgnoreCase))
             {
-                string previewRoot = await Task.Run(() => GetPreviewRoot(documentDirectory, configured), cancellationToken);
+                string previewRoot = await Task.Run(
+                    () => GetPreviewRoot(documentDirectory, configured, openFolderRoot), cancellationToken);
                 cancellationToken.ThrowIfCancellationRequested();
                 if (!string.IsNullOrEmpty(previewRoot) && !string.Equals(previewRoot, _previewRoot, StringComparison.OrdinalIgnoreCase))
                 {
@@ -1353,14 +1358,34 @@ namespace MarkdownEditor2022
             return rootPath;
         }
 
-        private static string GetPreviewRoot(string documentDirectory, string configuredRoot)
+        private static string GetOpenFolderRoot(IVsSolution solution)
+        {
+            ErrorHandler.ThrowOnFailure(solution.GetProperty(
+                (int)__VSPROPID7.VSPROPID_IsInOpenFolderMode, out object openFolderMode));
+            if (openFolderMode is not bool isOpenFolder || !isOpenFolder)
+            {
+                return null;
+            }
+
+            ErrorHandler.ThrowOnFailure(solution.GetSolutionInfo(
+                out string solutionDirectory, out _, out _));
+            return solutionDirectory;
+        }
+
+        internal static string GetPreviewRoot(string documentDirectory, string configuredRoot, string openFolderRoot = null)
         {
             if (!string.IsNullOrWhiteSpace(configuredRoot) && Directory.Exists(configuredRoot))
             {
                 return Path.GetFullPath(configuredRoot);
             }
 
-            DirectoryInfo directory = string.IsNullOrWhiteSpace(documentDirectory) ? null : new DirectoryInfo(documentDirectory);
+            if (IsPathWithinPreviewRoot(documentDirectory, openFolderRoot))
+            {
+                return Path.GetFullPath(openFolderRoot);
+            }
+
+            DirectoryInfo documentFolder = string.IsNullOrWhiteSpace(documentDirectory) ? null : new DirectoryInfo(documentDirectory);
+            DirectoryInfo directory = documentFolder;
             while (directory != null)
             {
                 if (Directory.Exists(Path.Combine(directory.FullName, ".git")) ||
@@ -1373,7 +1398,7 @@ namespace MarkdownEditor2022
                 directory = directory.Parent;
             }
 
-            return documentDirectory;
+            return documentFolder?.Parent?.FullName ?? documentDirectory;
         }
 
         private static string ResolveConfiguredRootPath(string configuredRoot, string documentDirectory)
