@@ -224,14 +224,7 @@ namespace MarkdownEditor2022
             _document.Parsed += UpdateBrowser;
             _textView.LayoutChanged += UpdatePosition;
             _textView.TextBuffer.Changed += OnTextBufferChange;
-            // Browser performs the initial render for both Markdown and Mermaid.
-        }
-
-        private static bool IsStandaloneMermaidFile(string filePath)
-        {
-            string extension = Path.GetExtension(filePath);
-            return string.Equals(extension, ".mermaid", StringComparison.OrdinalIgnoreCase) ||
-                   string.Equals(extension, ".mmd", StringComparison.OrdinalIgnoreCase);
+            // Browser performs the initial render for Markdown and standalone diagrams.
         }
 
         /// <summary>
@@ -748,9 +741,9 @@ namespace MarkdownEditor2022
         {
             _lastEdit = DateTime.Now;
 
-            // Standalone Mermaid files do not use the Markdown parser, so refresh them directly.
+            // Standalone diagrams do not use the Markdown parser, so refresh them directly.
             // Normal Markdown previews refresh from the parser's current-snapshot completion event.
-            if (!_isDisposed && _viewModeController.ShowsPreview && IsStandaloneMermaidFile(_textView.TextBuffer.GetFileName()))
+            if (!_isDisposed && _viewModeController.ShowsPreview && DiagramSupport.IsStandaloneDiagram(_textView.TextBuffer.GetFileName()))
             {
                 _debouncer.Debounce(() => { _ = Browser.UpdateBrowserAsync(); }, _document.FileName);
             }

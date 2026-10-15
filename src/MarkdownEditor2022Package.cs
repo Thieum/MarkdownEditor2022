@@ -25,6 +25,8 @@ namespace MarkdownEditor2022
     [ProvideLanguageExtension(typeof(MarkdownEditorV2), Constants.FileExtensionRmd)]
     [ProvideLanguageExtension(typeof(MarkdownEditorV2), Constants.FileExtensionMermaid)]
     [ProvideLanguageExtension(typeof(MarkdownEditorV2), Constants.FileExtensionMmd)]
+    [ProvideLanguageExtension(typeof(MarkdownEditorV2), Constants.FileExtensionPuml)]
+    [ProvideLanguageExtension(typeof(MarkdownEditorV2), Constants.FileExtensionPlantUml)]
 
     [ProvideEditorFactory(typeof(MarkdownEditorV2), 0, false, CommonPhysicalViewAttributes = (int)__VSPHYSICALVIEWATTRIBUTES.PVA_SupportsPreview, TrustLevel = __VSEDITORTRUSTLEVEL.ETL_AlwaysTrusted)]
     [ProvideEditorLogicalView(typeof(MarkdownEditorV2), VSConstants.LOGVIEWID.TextView_string, IsTrusted = true)]
@@ -32,18 +34,22 @@ namespace MarkdownEditor2022
     [ProvideEditorExtension(typeof(MarkdownEditorV2), Constants.FileExtensionRmd, 1000)]
     [ProvideEditorExtension(typeof(MarkdownEditorV2), Constants.FileExtensionMermaid, 1000)]
     [ProvideEditorExtension(typeof(MarkdownEditorV2), Constants.FileExtensionMmd, 1000)]
+    [ProvideEditorExtension(typeof(MarkdownEditorV2), Constants.FileExtensionPuml, 1000)]
+    [ProvideEditorExtension(typeof(MarkdownEditorV2), Constants.FileExtensionPlantUml, 1000)]
     [ProvideEditorExtension(typeof(MarkdownEditorV2), ".*", 22)]
 
     [ProvideFileIcon(Constants.FileExtensionMd, "KnownMonikers.MarkdownFile")]
     [ProvideFileIcon(Constants.FileExtensionRmd, "KnownMonikers.MarkdownFile")]
     [ProvideFileIcon(Constants.FileExtensionMermaid, "KnownMonikers.SkinFile")]
     [ProvideFileIcon(Constants.FileExtensionMmd, "KnownMonikers.SkinFile")]
+    [ProvideFileIcon(Constants.FileExtensionPuml, "KnownMonikers.SkinFile")]
+    [ProvideFileIcon(Constants.FileExtensionPlantUml, "KnownMonikers.SkinFile")]
 
     [ProvideUIContextRule(PackageGuids.MarkdownFileSelectedString,
     name: "Markdown selected",
     expression: "markdown",
     termNames: ["markdown"],
-    termValues: ["HierSingleSelectionName:.(md|rmd|mermaid|mmd)$"])]
+    termValues: ["HierSingleSelectionName:.(md|rmd|mermaid|mmd|puml|plantuml)$"])]
     public sealed class MarkdownEditor2022Package : ToolkitPackage
     {
         private static DTE _dte;
@@ -102,7 +108,8 @@ namespace MarkdownEditor2022
             string ext = Path.GetExtension(_dte?.ActiveDocument?.FullName ?? "").ToLowerInvariant();
 
             return ext is Constants.FileExtensionMd or Constants.FileExtensionRmd
-                       or Constants.FileExtensionMermaid or Constants.FileExtensionMmd;
+                       or Constants.FileExtensionMermaid or Constants.FileExtensionMmd
+                       or Constants.FileExtensionPuml or Constants.FileExtensionPlantUml;
         }
     }
 }

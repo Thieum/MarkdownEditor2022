@@ -38,7 +38,8 @@ namespace MarkdownEditor2022
         public override string Name => Constants.LanguageName;
 
         public override string[] FileExtensions { get; } =
-            [Constants.FileExtensionMd, Constants.FileExtensionRmd, Constants.FileExtensionMermaid, Constants.FileExtensionMmd];
+            [Constants.FileExtensionMd, Constants.FileExtensionRmd, Constants.FileExtensionMermaid, Constants.FileExtensionMmd,
+                Constants.FileExtensionPuml, Constants.FileExtensionPlantUml];
 
         public override ViewFilter CreateViewFilter(CodeWindowManager manager, IVsTextView newView)
         {

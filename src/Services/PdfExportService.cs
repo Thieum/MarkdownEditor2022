@@ -33,9 +33,15 @@ namespace MarkdownEditor2022.Services
 
             try
             {
+                string renderedHtml = await Task.Run(() => HtmlGenerationService.BuildHtmlDocument(markdownFile));
+                if (PlantUmlExportService.ContainsDiagrams(renderedHtml))
+                {
+                    await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
+                    renderedHtml = await PlantUmlExportService.RenderAsync(renderedHtml, ThemeHelper.GetMermaidTheme());
+                }
                 await Task.Run(() =>
                 {
-                    string html = AddRenderingAssets(HtmlGenerationService.BuildHtmlDocument(markdownFile));
+                    string html = AddRenderingAssets(renderedHtml);
 
                     // Keep relative resources rooted next to the markdown file.
                     string markdownDir = Path.GetDirectoryName(markdownFile);
@@ -101,19 +107,7 @@ namespace MarkdownEditor2022.Services
                     webView.NavigationCompleted -= OnNavigationCompleted;
                 }
 
-                await WaitForRenderingAsync(webView.CoreWebView2);
-
-                CoreWebView2PrintSettings printSettings = webView.CoreWebView2.Environment.CreatePrintSettings();
-                printSettings.ShouldPrintBackgrounds = true;
-                printSettings.ShouldPrintHeaderAndFooter = false;
-                Task<bool> printTask = webView.CoreWebView2.PrintToPdfAsync(outputPdfPath, printSettings);
-                await WaitForCompletionAsync(printTask, TimeSpan.FromMinutes(2),
-                    $"Timed out writing the PDF export to: {outputPdfPath}");
-                bool printSuccess = await printTask;
-                if (!printSuccess)
-                {
-                    throw new InvalidOperationException($"PDF export failed. The browser could not write to: {outputPdfPath}");
-                }
+                await PrintRenderedToPdfAsync(webView.CoreWebView2, outputPdfPath);
             }
             finally
             {
@@ -142,6 +136,19 @@ namespace MarkdownEditor2022.Services
                     }
                 }
             }
+        }
+
+        internal static async Task PrintRenderedToPdfAsync(CoreWebView2 browser, string outputPdfPath)
+        {
+            await WaitForRenderingAsync(browser);
+            CoreWebView2PrintSettings settings = browser.Environment.CreatePrintSettings();
+            settings.ShouldPrintBackgrounds = true;
+            settings.ShouldPrintHeaderAndFooter = false;
+            Task<bool> print = browser.PrintToPdfAsync(outputPdfPath, settings);
+            await WaitForCompletionAsync(print, TimeSpan.FromMinutes(2),
+                $"Timed out writing the PDF export to: {outputPdfPath}");
+            if (!await print)
+                throw new InvalidOperationException($"PDF export failed. The browser could not write to: {outputPdfPath}");
         }
 
         internal static async Task WaitForCompletionAsync(Task task, TimeSpan timeout, string timeoutMessage)

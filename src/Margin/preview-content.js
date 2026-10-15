@@ -66,10 +66,12 @@
     }, true);
     trackLibraries();
 
-    // Let initial scripts and their window-load handlers start before changing the DOM.
-    var initialLoad = document.readyState === 'complete' ? Promise.resolve() :
+    // Images must not hold up feature rendering. Allow DOM-ready script handlers to start first.
+    var initialLoad = document.readyState !== 'loading' ? Promise.resolve() :
         new Promise(function (resolve) {
-            window.addEventListener('load', function () { setTimeout(resolve, 0); }, { once: true });
+            function loaded() { setTimeout(resolve, 0); }
+            document.addEventListener('DOMContentLoaded', loaded, { once: true });
+            window.addEventListener('load', loaded, { once: true });
         });
 
     async function waitForRendering() {
@@ -153,7 +155,7 @@
 
     function wrapTables(root) {
         Array.from(root.querySelectorAll('table')).forEach(function (table) {
-            if (table.parentNode && table.parentNode.matches('.markdown-table-wrapper')) return;
+            if (table.parentElement && table.parentElement.matches('.markdown-table-wrapper')) return;
             var wrapper = document.createElement('div');
             wrapper.setAttribute('class', 'markdown-table-wrapper');
             table.parentNode.insertBefore(wrapper, table);
@@ -224,9 +226,10 @@
 
         // Each feature gets only newly inserted subtrees; retained nodes stay untouched.
         var code = collect(roots, 'code').filter(function (node) {
-            return node.closest('[class*="language-"]') && !node.closest('.mermaid');
+            return node.closest('[class*="language-"]') && !node.closest('.mermaid, .plantuml');
         });
         var diagrams = collect(roots, '.mermaid');
+        var plantUml = collect(roots, '.plantuml');
         var mathRoots = roots.filter(function (root) { return root.matches('.math') || root.querySelector('.math'); });
         if (code.length) {
             await load('prism.js', function () { return window.Prism && typeof window.Prism.highlightElement === 'function'; });
@@ -239,6 +242,12 @@
                 flowchart: { htmlLabels: true }, sequence: { useMaxWidth: true }
             });
             await window.mermaid.run({ nodes: diagrams, suppressErrors: false });
+        }
+        if (plantUml.length) {
+            await load('plantuml-preview.js', function () {
+                return window.MarkdownPlantUml && typeof window.MarkdownPlantUml.render === 'function';
+            });
+            await window.MarkdownPlantUml.render(plantUml, request.theme);
         }
         if (mathRoots.length) {
             var math = await mathJax();

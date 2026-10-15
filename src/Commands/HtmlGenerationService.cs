@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -6,6 +7,7 @@ using EnvDTE;
 using Markdig;
 using Markdig.Renderers;
 using Markdig.Syntax;
+using MarkdownEditor2022.Services;
 
 namespace MarkdownEditor2022
 {
@@ -13,6 +15,8 @@ namespace MarkdownEditor2022
     {
         private const string HtmlTemplateFileName = "md-template.html";
         private const string HtmlExtension = ".html";
+        private static readonly object _generationLock = new();
+        private static readonly Dictionary<string, object> _generations = new(StringComparer.OrdinalIgnoreCase);
         private static readonly Regex _anchorHrefRegex = new(
             @"(?<prefix><a\b[^>]*\bhref\s*=\s*"")(?<url>[^""]+)(?<suffix>"")",
             RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
@@ -57,12 +61,60 @@ namespace MarkdownEditor2022
                 throw new ArgumentException("Markdown file path cannot be null or empty.", nameof(markdownFile));
             }
 
-            string htmlFile = GetHtmlFileName(markdownFile);
-            string html = await Task.Run(() => BuildHtmlDocument(markdownFile));
-            await Task.Run(() => File.WriteAllText(htmlFile, html, new UTF8Encoding(true)));
+            string generationPath = Path.GetFullPath(markdownFile);
+            object generation = BeginGeneration(generationPath);
+            try
+            {
+                string htmlFile = GetHtmlFileName(markdownFile);
+                string html = await Task.Run(() => BuildHtmlDocument(markdownFile));
+                if (PlantUmlExportService.ContainsDiagrams(html))
+                {
+                    await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
+                    html = await PlantUmlExportService.RenderAsync(html, ThemeHelper.GetMermaidTheme());
+                }
+                await Task.Run(() => WriteCurrentGeneration(generationPath, generation, htmlFile, html));
+                await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
+                lock (_generationLock) { EnsureCurrentGeneration(generationPath, generation); }
+                AddNestedHtmlFile(markdownFile, htmlFile);
+            }
+            finally { EndGeneration(generationPath, generation); }
+        }
 
-            await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
-            AddNestedHtmlFile(markdownFile, htmlFile);
+        internal static object BeginGeneration(string path)
+        {
+            object generation = new();
+            lock (_generationLock) { _generations[path] = generation; }
+            return generation;
+        }
+
+        internal static void WriteCurrentGeneration(string path, object generation, string outputFile, string html)
+        {
+            // Rendering can span several saves. An older SVG must never replace a newer export.
+            lock (_generationLock)
+            {
+                EnsureCurrentGeneration(path, generation);
+                File.WriteAllText(outputFile, html, new UTF8Encoding(true));
+            }
+        }
+
+        internal static void EndGeneration(string path, object generation)
+        {
+            lock (_generationLock)
+            {
+                if (_generations.TryGetValue(path, out object current) && ReferenceEquals(current, generation))
+                    _generations.Remove(path);
+            }
+        }
+
+        internal static void CancelGeneration(string path)
+        {
+            lock (_generationLock) { _generations.Remove(Path.GetFullPath(path)); }
+        }
+
+        private static void EnsureCurrentGeneration(string path, object generation)
+        {
+            if (!_generations.TryGetValue(path, out object current) || !ReferenceEquals(current, generation))
+                throw new OperationCanceledException("HTML generation was superseded by a newer save or disabled.");
         }
 
         public static void DisableHtmlGeneration(string markdownFile)
@@ -75,6 +127,7 @@ namespace MarkdownEditor2022
             }
 
             string htmlFile = GetHtmlFileName(markdownFile);
+            CancelGeneration(markdownFile);
             DTE dte = Package.GetGlobalService(typeof(DTE)) as DTE;
 
             ProjectItem htmlItem = dte?.Solution?.FindProjectItem(htmlFile);
@@ -119,7 +172,8 @@ namespace MarkdownEditor2022
             return extension.Equals(Constants.FileExtensionMd, StringComparison.OrdinalIgnoreCase)
                 || extension.Equals(Constants.FileExtensionRmd, StringComparison.OrdinalIgnoreCase)
                 || extension.Equals(Constants.FileExtensionMermaid, StringComparison.OrdinalIgnoreCase)
-                || extension.Equals(Constants.FileExtensionMmd, StringComparison.OrdinalIgnoreCase);
+                || extension.Equals(Constants.FileExtensionMmd, StringComparison.OrdinalIgnoreCase)
+                || DiagramSupport.IsPlantUmlFile(filePath);
         }
 
         public static string GetHtmlFileName(string markdownFile)
@@ -140,10 +194,20 @@ namespace MarkdownEditor2022
             }
 
             string markdown = File.ReadAllText(markdownFile);
-            MarkdownDocument document = Markdown.Parse(markdown, Document.PipelineToGenerateHtml);
-            string content = document.ToHtml(Document.PipelineToGenerateHtml).Replace("\n", Environment.NewLine);
+            string content;
+            string title;
+            if (DiagramSupport.IsPlantUmlFile(markdownFile))
+            {
+                content = DiagramSupport.RenderStandalone(markdownFile, markdown);
+                title = Path.GetFileNameWithoutExtension(markdownFile);
+            }
+            else
+            {
+                MarkdownDocument document = Markdown.Parse(markdown, Document.PipelineToGenerateHtml);
+                content = DiagramSupport.NormalizePlantUml(document.ToHtml(Document.PipelineToGenerateHtml).Replace("\n", Environment.NewLine));
+                title = GetTitle(markdownFile, document);
+            }
             content = RewriteRelativeExtensionlessAnchorHrefs(content);
-            string title = GetTitle(markdownFile, document);
 
             return CreateFromHtmlTemplate(markdownFile, title, content);
         }

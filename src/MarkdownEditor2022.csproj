@@ -103,6 +103,10 @@
     <Content Include="Margin\preview-content.js">
       <IncludeInVSIX>true</IncludeInVSIX>
     </Content>
+    <Content Include="Margin\plantuml-preview.js;Margin\plantuml-renderer.html;Margin\plantuml-renderer.mjs;Margin\plantuml\**\*">
+      <IncludeInVSIX>true</IncludeInVSIX>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
     <Content Include="Registry.pkgdef">
       <IncludeInVSIX>true</IncludeInVSIX>
     </Content>

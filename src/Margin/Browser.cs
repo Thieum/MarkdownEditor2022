@@ -70,7 +70,6 @@ namespace MarkdownEditor2022
             "Build.BuildSolution",
         };
         private static readonly string[] _markdownExtensions = [".md", ".markdown", ".mdown", ".mkd"];
-        private static readonly string[] _mermaidExtensions = [".mermaid", ".mmd"];
 
         public readonly WebView2CompositionControl _browser = new PreviewWebView() { HorizontalAlignment = HorizontalAlignment.Stretch, Margin = new Thickness(0), Visibility = Visibility.Hidden };
 
@@ -464,18 +463,6 @@ namespace MarkdownEditor2022
             _browser.SetResourceReference(Control.BackgroundProperty, EnvironmentColors.ToolWindowBackgroundBrushKey);
         }
 
-        /// <summary>
-        /// Returns true if the current file is a standalone mermaid file (.mermaid or .mmd).
-        /// </summary>
-        private bool IsMermaidFile
-        {
-            get
-            {
-                string ext = Path.GetExtension(_file);
-                return Array.Exists(_mermaidExtensions, e => e.Equals(ext, StringComparison.OrdinalIgnoreCase));
-            }
-        }
-
         public void Dispose()
         {
             CancellationTokenSource updateCancellation;
@@ -494,6 +481,7 @@ namespace MarkdownEditor2022
             if (_browser.CoreWebView2 != null)
             {
                 _browser.CoreWebView2.WebMessageReceived -= OnWebMessageReceived;
+                _browser.CoreWebView2.DOMContentLoaded -= OnDomContentLoaded;
                 _browser.CoreWebView2.NavigationCompleted -= OnNavigationCompleted;
             }
 
@@ -560,6 +548,7 @@ namespace MarkdownEditor2022
                     }
 
                     _browser.CoreWebView2.WebMessageReceived += OnWebMessageReceived;
+                    _browser.CoreWebView2.DOMContentLoaded += OnDomContentLoaded;
                     _browser.CoreWebView2.NavigationCompleted += OnNavigationCompleted;
                     _browser.CoreWebView2.SetVirtualHostNameToFolderMapping(
                         _mappedMarkdownEditorVirtualHostName, GetFolder(), CoreWebView2HostResourceAccessKind.Allow);
@@ -1172,11 +1161,11 @@ namespace MarkdownEditor2022
                 string html;
                 MarkdownDocument renderedMarkdown = null;
 
-                if (IsMermaidFile)
+                if (DiagramSupport.IsStandaloneDiagram(_file))
                 {
                     ITextSnapshot snapshot = _textView.TextBuffer.CurrentSnapshot;
                     await EnsurePreviewRootAsync(null, updateToken);
-                    html = await Task.Run(() => $"<pre class=\"mermaid\">{WebUtility.HtmlEncode(snapshot.GetText())}</pre>", updateToken);
+                    html = await Task.Run(() => DiagramSupport.RenderStandalone(_file, snapshot.GetText()), updateToken);
                 }
                 else
                 {
@@ -1232,8 +1221,8 @@ namespace MarkdownEditor2022
                     await Task.Delay(100);
                     await NavigateToFragmentAsync(pendingFragment);
                 }
-                // Only sync navigation if scroll sync is enabled (not applicable for mermaid files)
-                else if (!IsMermaidFile && AdvancedOptions.Instance.EnableScrollSync)
+                // Standalone diagrams have no Markdown source-line anchors.
+                else if (!DiagramSupport.IsStandaloneDiagram(_file) && AdvancedOptions.Instance.EnableScrollSync)
                 {
                     await SyncNavigationAsync(isTyping: false);
                 }
@@ -1278,6 +1267,7 @@ namespace MarkdownEditor2022
                 htmlRenderer.Render(md);
 
                 string html = htmlWriter.ToString();
+                html = DiagramSupport.NormalizePlantUml(html);
 
                 // Replace language aliases with canonical PrismJS language names
                 html = _languageRegex.Replace(html, match =>
@@ -2068,6 +2058,8 @@ namespace MarkdownEditor2022
         .markdown-table-wrapper {{max-width: 100%; margin: 0 0 16px; overflow-x: auto;}}
         .markdown-table-wrapper > table {{display: table; width: max-content; max-width: none; margin-bottom: 0; overflow: visible;}}
         .markdown-body img {{background-color: transparent;}}
+        .plantuml:has(svg) {{white-space: normal; overflow-x: auto;}}
+        .plantuml svg {{max-width: 100%; height: auto;}}
     </style>";
                 string defaultContent = @"
     <div id=""___markdown-content___"" class=""markdown-body"" [CONTENTEDITABLE]>
@@ -2338,7 +2330,7 @@ namespace MarkdownEditor2022
             return _stringBuilderPool.TryDequeue(out StringBuilder sb) ? sb : new StringBuilder(2048);
         }
 
-        private static string EscapeForJavaScript(string input)
+        internal static string EscapeForJavaScript(string input)
         {
             return string.IsNullOrEmpty(input)
                 ? input
@@ -2511,6 +2503,15 @@ namespace MarkdownEditor2022
 
             _recursiveFileLookupCache.Set(cacheKey, (resolvedPath, nowUtc.Add(_fileDiscoveryCacheDuration)));
             return resolvedPath;
+        }
+
+        private void OnDomContentLoaded(object sender, CoreWebView2DOMContentLoadedEventArgs e)
+        {
+            if (_navigationCompletion != null && e.NavigationId == _navigationId)
+            {
+                _isTemplateLoaded = true;
+                _navigationCompletion.TrySetResult(true);
+            }
         }
 
         private void OnNavigationCompleted(object sender, CoreWebView2NavigationCompletedEventArgs e)

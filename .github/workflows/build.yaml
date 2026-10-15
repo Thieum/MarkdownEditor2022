@@ -97,6 +97,10 @@ jobs:
         --logger "trx;LogFileName=test-results.trx"
         --collect "Code Coverage"
 
+    - name: Test PlantUML updater contracts
+      shell: powershell
+      run: .\test\scripts-updater.test.ps1
+
     - name: Report test results
       uses: dorny/test-reporter@v3
       if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}

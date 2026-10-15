@@ -141,6 +141,7 @@ namespace MarkdownEditor2022
         {
             if (e.FileActionType == FileActionTypes.ContentSavedToDisk)
             {
+                HtmlGenerationService.CancelGeneration(e.FilePath);
                 MatchCollection matches = _tocRegex.Matches(_docView.TextBuffer.CurrentSnapshot.GetText());
 
                 if (matches.Count > 0)
@@ -249,4 +250,3 @@ namespace MarkdownEditor2022
         }
     }
 }
-

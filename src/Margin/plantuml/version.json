@@ -1,0 +1,258 @@
+{
+  "version": "1.2026.8",
+  "package": "https://registry.npmjs.org/@plantuml/core/-/core-1.2026.8.tgz",
+  "integrity": "sha512-md2wGuaIJnAq1yKkedSpQE68cLsvZvctwzWHkDAnC3DTVLe/MSd/2vr4ETwr6jtc1av8cdxCohFuW4VGejMHyw==",
+  "release": "https://github.com/plantuml/plantuml/releases/download/v1.2026.8/js-plantuml-1.2026.8.zip",
+  "releaseSha256": "ce892b85ef2465d77e8a2c52eb37558bbbb0aecf19fbd4ef4c7ddf73f9e8d16b",
+  "stdlibCommit": "7167ca01416dac036fb11a72898ad7cbd008031a",
+  "viz": {
+    "version": "3.24.0",
+    "commit": "0b57111ca020cc19fd4034ce880245c5e8e786b2",
+    "sources": [
+      {
+        "uri": "https://github.com/libexpat/libexpat/releases/download/R_2_7_3/expat-2.7.3.tar.gz",
+        "digest": {
+          "sha256": "821ac9710d2c073eaf13e1b1895a9c9aa66c1157a99635c639fbff65cdbdd732"
+        }
+      },
+      {
+        "uri": "https://gitlab.com/api/v4/projects/4207231/packages/generic/graphviz-releases/14.1.1/graphviz-14.1.1.tar.gz",
+        "digest": {
+          "sha256": "f7a709b59872f49ab996d68102822a331a66cce80dd6b8e3c0c944cdb4ce599b"
+        }
+      }
+    ]
+  },
+  "files": [
+    {
+      "name": "adaml.min.js",
+      "sha256": "2eea767c31c06d1e0c3137d71581e7c66bf2b0d3fd07d7b4d02ba221b8be73a5",
+      "size": 18025
+    },
+    {
+      "name": "archimate.min.js",
+      "sha256": "5a06d2cc43cecff2b720cd6cbc08d60a6259211316f779c9f666c8c5988dfd85",
+      "size": 144087
+    },
+    {
+      "name": "awslib.min.js",
+      "sha256": "b6184dae90807c6863a7b527fcc2bcc2e4dbf9b62e6161dd81a625ce0b78c14e",
+      "size": 1884
+    },
+    {
+      "name": "awslib10.min.js",
+      "sha256": "019f09186ae77196d81b47a7ab94c1f2b9b9e841f75d6051e69c48d1ea14c7af",
+      "size": 1681991
+    },
+    {
+      "name": "awslib14.min.js",
+      "sha256": "b6391f87a7efb7f59a92c1ec07d2cc7e85de190e1bfd2155967e4afbbf7525c7",
+      "size": 8188110
+    },
+    {
+      "name": "awslib20.min.js",
+      "sha256": "1ecae17a7fa4059c7984bbc665e581225288e6c0591e6a8e07519643f2385f41",
+      "size": 10182413
+    },
+    {
+      "name": "azure.min.js",
+      "sha256": "aa1ffc61501675159dedd678f03fb0a4a4bfa1802b7dd31be3194543ef8acffd",
+      "size": 532887
+    },
+    {
+      "name": "bootstrap.min.js",
+      "sha256": "66649652b2973a66973df95d41fd34478ba889c690237484aae03f588dbf0ad0",
+      "size": 607
+    },
+    {
+      "name": "bootstrap1.12.1.min.js",
+      "sha256": "965334ce144b8ff7501d0b559fb8950537bb4e3d6fb81fcf0cff3f139d7413e2",
+      "size": 1062628
+    },
+    {
+      "name": "bootstrap1.13.1.min.js",
+      "sha256": "3f5b0f7a952ede940cd541e157ae90acc7706561a4e80e3ad4551b1f5ed2aace",
+      "size": 1086584
+    },
+    {
+      "name": "c4.min.js",
+      "sha256": "961653a412fa60ca3f0a262f788a3b65c8e9c8fbf6475df7beb79b11bb22c7be",
+      "size": 181698
+    },
+    {
+      "name": "classy-c4.min.js",
+      "sha256": "58fc0c02dd66557baa0545a2cc6ce1bae6c667221e77dee327051ebc9ac30b53",
+      "size": 43675
+    },
+    {
+      "name": "classy.min.js",
+      "sha256": "734cdc4c516ec78cbb895565037d3eebdf869d90c401b430d41ad0b4a2b1f38f",
+      "size": 44380
+    },
+    {
+      "name": "cloudinsight.min.js",
+      "sha256": "b14f6a633d7131473af3baecb572a9231775c348876b58ec44391239e451e3ff",
+      "size": 193343
+    },
+    {
+      "name": "cloudogu.min.js",
+      "sha256": "cc3b2b3640fd122616f0826e1ea01bc40b2d0050fe174849b8ef2a98646eb74b",
+      "size": 129591
+    },
+    {
+      "name": "domainstory.min.js",
+      "sha256": "87bd5b5c166510e1dfcf157c28c68f7d1ec90b77cde81d45e76586c54f91c864",
+      "size": 30442
+    },
+    {
+      "name": "edgy.min.js",
+      "sha256": "3c786356059a37d04a354bf6e451c94c5b1db3374a1531a33c174a007ef237c3",
+      "size": 26292
+    },
+    {
+      "name": "eip.min.js",
+      "sha256": "1b075a46c425c3f83e4aa6c9e980cae117c0a4f772db0599498a4be7540a1774",
+      "size": 39425
+    },
+    {
+      "name": "elastic.min.js",
+      "sha256": "18567b88fd7b9856cc98d4112fc0b270f2e8d47a2e56291c3cfe32729c140499",
+      "size": 416054
+    },
+    {
+      "name": "emoji.js",
+      "sha256": "e3b97a103b48bb00a6d77cf0667f3a0fda0a3799cfbc5e22494fcde024a18e49",
+      "size": 1876355
+    },
+    {
+      "name": "expat-sources.tar.gz",
+      "sha256": "821ac9710d2c073eaf13e1b1895a9c9aa66c1157a99635c639fbff65cdbdd732",
+      "size": 800387
+    },
+    {
+      "name": "gcp.min.js",
+      "sha256": "3aa51fb5954bb23df1336d13b7bf24155c02dfee19833c5fcc795b6d3e4d3373",
+      "size": 279084
+    },
+    {
+      "name": "graphviz-sources.tar.gz",
+      "sha256": "f7a709b59872f49ab996d68102822a331a66cce80dd6b8e3c0c944cdb4ce599b",
+      "size": 26818350
+    },
+    {
+      "name": "ibm.min.js",
+      "sha256": "90099c682e3d428b0af799787f99b2b928c19bfcf5a3719d36ab09dd550f7f51",
+      "size": 23636085
+    },
+    {
+      "name": "k8s.min.js",
+      "sha256": "ae7f34bd12855986701d0190f2d1cb9a82c71f82ccc3bf855e013c5074dfe891",
+      "size": 50160
+    },
+    {
+      "name": "kubernetes.min.js",
+      "sha256": "5f901a02b3398d2a6987af32df106c97ecc6ce449b8ce78940076b2f4c2839b5",
+      "size": 307369
+    },
+    {
+      "name": "LICENSE",
+      "sha256": "b0475db7325c48eede0eee5e44aea92dad28c755aed4484a6cdde99cedea9446",
+      "size": 3666
+    },
+    {
+      "name": "logos.min.js",
+      "sha256": "f421b702769a7eba61eacb90e821ec1a4729756eb6865d3a0a009f5c0cd9526f",
+      "size": 5453298
+    },
+    {
+      "name": "material.min.js",
+      "sha256": "1aaf3af0e4c5d9c2c4fd1e487d4707dde5f3d709531907fbd792b1b93051a8b5",
+      "size": 528
+    },
+    {
+      "name": "material2.1.19.min.js",
+      "sha256": "d476a9d269642c1e9eeb8494f6fb9b7e04611d5cdcf7424681ad2beab04838e5",
+      "size": 6978761
+    },
+    {
+      "name": "material2.min.js",
+      "sha256": "9fad39687c9a23cffa5ad5ad0b11fb0ed7f03dd97e2ce4f8836abc2f7b7b7bd4",
+      "size": 533
+    },
+    {
+      "name": "material7.4.47.min.js",
+      "sha256": "5e20c3f08bde99d040fb7fe86ab179b34da2d8e001e9134d2bcbbdcd8513d228",
+      "size": 17151755
+    },
+    {
+      "name": "material7.min.js",
+      "sha256": "7f537722af787a914f247fed79bb5a522e1508bf13589b0f55f9fc29483d8b4b",
+      "size": 533
+    },
+    {
+      "name": "NOTICE.txt",
+      "sha256": "c6368053e27ba7ffd655ee33d30bc53f82538f38bcae2a416676de4a2a247e0e",
+      "size": 1225
+    },
+    {
+      "name": "office.min.js",
+      "sha256": "1a29d4355f53bbd73b2fa1378f922a1a8ca88dcd5d022166851cd5682ba85458",
+      "size": 1430165
+    },
+    {
+      "name": "openiconic-LICENSE.txt",
+      "sha256": "b3f22ce84cba8df34011f5d420ec87ad75d7f91700f21cdc8589ee388594325e",
+      "size": 1073
+    },
+    {
+      "name": "openiconic.js",
+      "sha256": "b34a6d7c0315ad4c1d780bcfe92e7bfa89abbd4fa20ae419e3409f1cc4f56c52",
+      "size": 51251
+    },
+    {
+      "name": "osa.min.js",
+      "sha256": "4f320e60e55cf01fe244f44d736824e2014b7371473a0af925559cfaca5059c0",
+      "size": 1942213
+    },
+    {
+      "name": "osa2.min.js",
+      "sha256": "e01336fcc1e8c30b5540e820f10a3cb4caf8f95a983ff6585d86bcefe3c272f4",
+      "size": 105852
+    },
+    {
+      "name": "plantuml.js",
+      "sha256": "ade8f15ed7f2a3225814332d3ac6d05bc7ebdbbec8630512cc7cf678bc0c4d52",
+      "size": 3947570
+    },
+    {
+      "name": "stdlib-sources.zip",
+      "sha256": "30b7fed6099623fcd568eab830f9f1fb0128e765db225e8108bd5a76f4e0334a",
+      "size": 59487173
+    },
+    {
+      "name": "themes.js",
+      "sha256": "d6f508704b276b66631cfff05291de3013ab7807972b7cb2b77a14d4beab2c2d",
+      "size": 326396
+    },
+    {
+      "name": "tupadr3.min.js",
+      "sha256": "38533c680fc8bd6fc7c90690f570f358f9c0f23a00d682cbe038e68d2df9abb7",
+      "size": 20227666
+    },
+    {
+      "name": "twemoji-LICENSE.txt",
+      "sha256": "8ae9438818c26e4873b91d8c6ad620526c011e27e125677f13031eda903f007c",
+      "size": 18524
+    },
+    {
+      "name": "viz-global.js",
+      "sha256": "fc6ca2de83dd4e3fca967d5214122777890a5cd1ab101115a1f716fc84e6dc5e",
+      "size": 1445436
+    },
+    {
+      "name": "viz-LICENSE.txt",
+      "sha256": "f1fb91bf7cbcb42b2af56949e4fa909e1979d5b57c2826cabacdb4b631457720",
+      "size": 1066
+    }
+  ]
+}

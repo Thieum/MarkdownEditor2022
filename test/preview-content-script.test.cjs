@@ -118,6 +118,24 @@ function environment(html = '', libraries = {}, readyState = 'complete') {
 const settle = async () => { for (let i = 0; i < 12; i++) await new Promise(resolve => setImmediate(resolve)); };
 const deferred = () => { let resolve, reject; const promise = new Promise((a, b) => { resolve = a; reject = b; }); return { promise, resolve, reject }; };
 
+test('DOM readiness renders both diagram languages without waiting for window load', async () => {
+    const rendered = [];
+    const env = environment('<pre class="mermaid">pie title Netflix</pre><pre class="plantuml">@startuml\nAlice -> Bob\n@enduml</pre>', {
+        mermaid: { initialize() {}, run: async ({ nodes }) => { rendered.push(...nodes); } },
+        MarkdownPlantUml: { render: async nodes => { rendered.push(...nodes); } }
+    }, 'loading');
+    env.window.__initializeMarkdownPreview('dark', 1);
+    await settle();
+    assert.equal(rendered.length, 0);
+    env.document.readyState = 'interactive';
+    env.document.fire('DOMContentLoaded');
+    await new Promise(resolve => setTimeout(resolve, 5));
+    await settle();
+    assert.equal(rendered.length, 2);
+    assert.ok(env.messages.includes('previewComplete:1'));
+    assert.deepEqual(env.errors, []);
+});
+
 test('original signatures preserve mutated nodes, duplicates, text, comments and reordering', async () => {
     const env = environment('<p>A</p><p>B</p><p>A</p> text<!--note-->');
     const [first, second, duplicate, text, comment] = env.container.childNodes;
@@ -425,6 +443,132 @@ test('failed requests report their ID without success and subsequent requests st
     unnumbered.update('<pre class="mermaid">bad</pre>');
     await settle();
     assert.ok(unnumbered.messages.every(x => x.startsWith('previewError:')));
+});
+
+test('PlantUml_LoaderCached_InsertsAndRetainsExpectedBlocks', async () => {
+    const rendered = [];
+    const env = environment();
+    const firstMarkup = '<pre class="plantuml">first</pre>';
+    const latestMarkup = '<pre class="plantuml">latest</pre>';
+    env.update(firstMarkup, 'dark', 'first');
+    await settle();
+    assert.equal(env.document.scripts.length, 1);
+    const asset = env.document.scripts[0];
+    assert.equal(asset.src, 'http://markdown-editor-host/margin/plantuml-preview.js');
+
+    env.update(latestMarkup, 'dark', 'latest');
+    await settle();
+    assert.equal(env.document.scripts.length, 1);
+    const themes = [];
+    env.window.MarkdownPlantUml = { render: async (nodes, theme) => { rendered.push(...nodes); themes.push(theme); } };
+    env.loaded(asset);
+    await settle();
+
+    assert.deepEqual(rendered.map(node => node.innerHTML), ['first', 'latest']);
+    const retained = env.container.firstChild;
+    retained.innerHTML = '<svg>rendered latest diagram</svg>';
+    env.update(latestMarkup);
+    await settle();
+    assert.equal(env.container.firstChild, retained);
+    assert.equal(retained.innerHTML, '<svg>rendered latest diagram</svg>');
+    assert.equal(rendered.length, 2);
+
+    env.update(latestMarkup + '<pre class="plantuml">new</pre>');
+    await settle();
+    assert.equal(env.container.firstChild, retained);
+    assert.equal(rendered.length, 3);
+    assert.equal(rendered[2].innerHTML, 'new');
+    assert.equal(env.document.scripts.length, 1);
+    assert.deepEqual(themes, ['dark', 'dark', 'dark']);
+    assert.deepEqual(env.errors, []);
+});
+
+test('PlantUml_RenderCompletionGatesAcknowledgementsAndCoalescesUpdates', async () => {
+    const firstRender = deferred(), finalRender = deferred();
+    const rendered = [];
+    let renderCount = 0;
+    const env = environment('', {
+        MarkdownPlantUml: {
+            render: nodes => {
+                rendered.push(...nodes);
+                return (++renderCount === 1 ? firstRender.promise : finalRender.promise);
+            }
+        }
+    });
+
+    env.update('<pre class="plantuml">initial</pre>', 'dark', 'initial');
+    await settle();
+    assert.equal(rendered.length, 1);
+    assert.deepEqual(env.messages, []);
+
+    env.update('<p>discarded intermediate</p>', 'dark', 'discarded');
+    env.update('<pre class="plantuml">final</pre>', 'dark', 'final');
+    await settle();
+    assert.deepEqual(env.messages, []);
+    firstRender.resolve();
+    await settle();
+
+    assert.equal(renderCount, 2);
+    assert.deepEqual(env.messages, ['previewComplete:initial']);
+    assert.equal(env.container.innerHTML, '<pre class="plantuml">final</pre>');
+    finalRender.resolve();
+    await settle();
+
+    assert.deepEqual(env.messages, ['previewComplete:initial', 'previewComplete:final']);
+    assert.ok(!env.messages.includes('previewComplete:discarded'));
+    assert.deepEqual(rendered.map(node => node.innerHTML), ['initial', 'final']);
+    assert.deepEqual(env.errors, []);
+});
+
+test('PlantUml_RenderFailureIsReportedAndLaterDiagramRecovers', async () => {
+    const delayedFailure = deferred();
+    const rendered = [];
+    const env = environment('', {
+        MarkdownPlantUml: {
+            render: nodes => {
+                rendered.push(...nodes);
+                return rendered.length === 1 ? delayedFailure.promise : Promise.resolve();
+            }
+        }
+    });
+
+    env.update('<pre class="plantuml">broken</pre>', 'dark', 'failed');
+    await settle();
+    assert.equal(rendered.length, 1);
+    assert.deepEqual(env.messages, []);
+    delayedFailure.reject(new Error('PlantUML render failed'));
+    await settle();
+
+    assert.ok(env.messages.includes('previewError:PlantUML render failed'));
+    assert.ok(env.messages.includes('previewFailed:failed'));
+    assert.ok(!env.messages.includes('previewComplete:failed'));
+    env.update('<pre class="plantuml">broken</pre>', 'dark', 'recovered');
+    await settle();
+
+    assert.deepEqual(rendered.map(node => node.innerHTML), ['broken', 'broken']);
+    assert.notEqual(rendered[0], rendered[1]);
+    assert.ok(env.messages.includes('previewComplete:recovered'));
+    assert.ok(!env.messages.includes('previewFailed:recovered'));
+    assert.deepEqual(env.errors.map(args => args[0]), ['Markdown preview:']);
+});
+
+test('Prism_SkipsCodeNestedInsidePlantUmlDiagrams', async () => {
+    const highlighted = [], rendered = [];
+    const env = environment('', {
+        Prism: { highlightElement: node => highlighted.push(node) },
+        MarkdownPlantUml: { render: async nodes => { rendered.push(...nodes); } }
+    });
+
+    env.update(
+        '<pre class="plantuml"><code class="language-plantuml">Alice -> Bob</code></pre>' +
+        '<pre><code class="language-js">const value = 1;</code></pre>');
+    await settle();
+
+    assert.equal(rendered.length, 1);
+    assert.equal(rendered[0].querySelector('code').innerHTML, 'Alice -> Bob');
+    assert.equal(highlighted.length, 1);
+    assert.equal(highlighted[0].innerHTML, 'const value = 1;');
+    assert.deepEqual(env.errors, []);
 });
 
 test('MathJax script load can precede typesetting API creation during asynchronous startup', async () => {

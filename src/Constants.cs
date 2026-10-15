@@ -7,6 +7,8 @@ namespace MarkdownEditor2022
         public const string FileExtensionRmd = ".rmd";
         public const string FileExtensionMermaid = ".mermaid";
         public const string FileExtensionMmd = ".mmd";
+        public const string FileExtensionPuml = ".puml";
+        public const string FileExtensionPlantUml = ".plantuml";
         public static bool IsTest = false;
         public const string MarketplaceId = "MadsKristensen.MarkdownEditor2";
 

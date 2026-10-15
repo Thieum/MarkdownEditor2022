@@ -9,6 +9,7 @@ using System.Windows.Input;
 using System.Windows.Threading;
 using Markdig;
 using Markdig.Syntax;
+using MarkdownEditor2022.Services;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.Wpf;
 
@@ -25,6 +26,199 @@ namespace MarkdownEditor2022.UnitTests
             "<script src=\"http://markdown-editor-host/margin/preview-content.js\"></script>[scripts]</body></html>";
 
         public TestContext TestContext { get; set; } = null!;
+
+        [TestMethod]
+        [DataRow(false)]
+        [DataRow(true)]
+        [DoNotParallelize]
+        [Timeout(90000)]
+        public Task ProductionPreviewTemplate_InitialNavigationRendersBothDiagramLanguages(bool pendingImage) => RunAsync(async page =>
+        {
+            string source = "| Check | Status |\n| --- | --- |\n| Preview | Ready |\n\n" +
+                "```plantuml\n@startuml\nAlice -> Bob : Request\nBob --> Alice : Response\n@enduml\n```\n\n" +
+                "```mermaid\npie title NETFLIX\n\"Time spent looking for movie\" : 90\n\"Time spent watching it\" : 10\n```\n";
+            using Browser browser = new(Path.Combine(AppContext.BaseDirectory, "diagram-regression.md"), null!, null!, null!);
+            MethodInfo buildTemplate = typeof(Browser).GetMethod("BuildHtmlTemplate", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            string template = (string)buildTemplate.Invoke(browser,
+                [false, "#1e1e1e", "#ffffff", "#888888", false, false, AppContext.BaseDirectory])!;
+            string html = Browser.RenderHtmlDocument(Markdown.Parse(source, Document.Pipeline));
+            if (pendingImage)
+                html += "<img src=\"https://pending-preview-image.invalid/image.png\">";
+            (string document, bool hydrate) = Browser.BuildPreviewPage(template, html, "dark", 1);
+            Assert.IsFalse(hydrate);
+            async Task AssertDiagramsAsync()
+            {
+                await page.CompleteAsync(1);
+                await page.AssertScriptAsync("document.querySelectorAll('.markdown-table-wrapper > table').length === 1",
+                    "A top-level table must be wrapped without stopping diagram rendering.");
+                await page.AssertScriptAsync("!!document.querySelector('.plantuml svg') && !!document.querySelector('.mermaid svg')",
+                    "The production template must render both diagrams on navigation without waiting for Markdown images.");
+            }
+            if (pendingImage)
+                await page.WithPendingImageAsync(document, browser, async () =>
+                {
+                    await AssertDiagramsAsync();
+                    await page.AssertScriptAsync(Browser.BuildContentUpdateScript(html.Replace("Request", "Updated"), "dark", 2),
+                        "The preview must accept edits while a Markdown image is still loading.");
+                    await page.CompleteAsync(2);
+                    await page.AssertScriptAsync("document.querySelector('.plantuml svg').textContent.includes('Updated') && " +
+                        "!!document.querySelector('.mermaid svg')", "Both diagrams must survive an edit before window load.");
+                });
+            else
+            {
+                await page.NavigateAsync(document, fullPage: true);
+                await AssertDiagramsAsync();
+            }
+            page.AssertNoErrors();
+        });
+
+        // TeaVM/WASM browser cases are serialized to avoid oversubscribing the suite's process/thread pools.
+        [TestMethod]
+        [DataRow("forest")]
+        [DataRow("dark")]
+        [DoNotParallelize]
+        [Timeout(90000)]
+        public Task PlantUml_RealEngine_RendersMultipleDiagramsAndRetainsSvg(string theme) => RunAsync(async page =>
+        {
+            string source = "# Diagrams\n\n```plantuml\n@startuml\nAlice -> Bob : Hello\n@enduml\n```\n\n" +
+                "```puml\n@startuml\nclass Customer\nclass Order\nCustomer --> Order\n@enduml\n```\n";
+            string html = Browser.RenderHtmlDocument(Markdown.Parse(source, Document.Pipeline));
+            await page.NavigateAsync(html);
+            await page.AssertScriptAsync($"__initializeMarkdownPreview('{theme}', 1) === true", "Initialize PlantUML.");
+            await page.CompleteAsync(1);
+            await page.AssertScriptAsync("document.querySelectorAll('.plantuml svg').length === 2 && " +
+                "document.querySelectorAll('iframe').length === 1 && document.querySelector('.plantuml').textContent.includes('Hello') && " +
+                "Array.from(document.querySelectorAll('.plantuml'))[1].textContent.includes('Customer')",
+                "Both real sequence and Graphviz class diagrams must render with one engine. Markup: " + html +
+                " DOM: " + await page.ScriptAsync("document.getElementById('___markdown-content___').innerHTML"));
+            await page.AssertScriptAsync("Array.from(document.querySelectorAll('.plantuml svg')).every(svg => " +
+                $"Array.from(svg.querySelectorAll('text')).some(text => /^#(?:ffffff|e7e7e7)$/i.test(text.getAttribute('fill'))) === {(theme == "dark" ? "true" : "false")})",
+                "The selected theme must affect the actual generated SVG text colors, not only the preview background.");
+            await page.ScriptAsync("window.__savedPlantSvg = document.querySelector('.plantuml svg');");
+            await page.AssertScriptAsync(Browser.BuildContentUpdateScript(html + "<p>After</p>", theme, 2), "Update PlantUML.");
+            await page.CompleteAsync(2);
+            await page.AssertScriptAsync("document.querySelector('.plantuml svg') === __savedPlantSvg", "Unchanged diagrams retain their SVG.");
+            string changed = Browser.RenderHtmlDocument(Markdown.Parse(source.Replace("Hello", "Changed"), Document.Pipeline));
+            await page.AssertScriptAsync(Browser.BuildContentUpdateScript(changed, theme, 3), "Edit PlantUML.");
+            await page.CompleteAsync(3);
+            await page.AssertScriptAsync("document.querySelector('.plantuml').textContent.includes('Changed') && " +
+                "document.querySelector('.plantuml svg') !== __savedPlantSvg", "Changed source must render a fresh diagram.");
+            page.AssertNoErrors();
+            await page.AssertLocalPlantUmlRequestsAsync();
+        });
+
+        [TestMethod]
+        [DoNotParallelize]
+        [Timeout(90000)]
+        public Task PlantUml_OfflineResources_RenderC4ThemesEmojiAndIcons() => RunAsync(async page =>
+        {
+            string[] diagrams =
+            [
+                "@startuml\n!include <C4/C4_Context>\nPerson(user, \"User\")\nSystem(app, \"App\")\nRel(user, app, \"Uses\")\n@enduml",
+                "@startuml\n!theme cerulean\nAlice -> Bob : Hello <:smile:> <&person>\n@enduml"
+            ];
+            string html = string.Concat(diagrams.Select(source => DiagramSupport.RenderStandalone("diagram.puml", source)));
+            await page.NavigateAsync(html);
+            await page.InitializeAsync(1);
+            await page.CompleteAsync(1);
+            await page.AssertScriptAsync("document.querySelectorAll('.plantuml svg').length === 2 && " +
+                "document.querySelector('.plantuml').textContent.includes('Uses') && " +
+                "document.querySelectorAll('.plantuml svg path').length > 0",
+                "C4, bundled themes, emoji and icons must render using real offline resources.");
+            await page.AssertScriptAsync("['c4.min.js','themes.js','emoji.js','openiconic.js'].every(name => " +
+                "Array.from(MarkdownPlantUml.resourceUrls).some(url => url.endsWith('/' + name))) && " +
+                "!document.querySelectorAll('.plantuml')[1].textContent.includes('<:smile:>') && " +
+                "!document.querySelectorAll('.plantuml')[1].textContent.includes('<&person>')",
+                "Each optional bundle must actually load, and emoji/icon markup must become graphics rather than plain text.");
+            page.AssertNoErrors();
+            await page.AssertLocalPlantUmlRequestsAsync();
+        });
+
+        [TestMethod]
+        [DataRow("@startuml\n!include secret.puml\nAlice -> Bob\n@enduml")]
+        [DataRow("@startuml\n!include https://example.invalid/private.puml\nAlice -> Bob\n@enduml")]
+        [DataRow("@startuml\nthis is not valid plantuml\n@enduml")]
+        [DataRow("Alice -> Bob")]
+        [DataRow("@startuml\n!include <missing-library/file>\nAlice -> Bob\n@enduml")]
+        [DataRow("@startuml\n!theme nonexistent-theme\nAlice -> Bob\n@enduml")]
+        [DoNotParallelize]
+        [Timeout(90000)]
+        public Task PlantUml_InvalidOrExternalSource_ReportsFailureAndRecovers(string source) => RunAsync(async page =>
+        {
+            await page.NavigateAsync("");
+            await page.UpdateAsync(DiagramSupport.RenderStandalone("bad.puml", source), 1);
+            await page.FailedAsync(1);
+            await page.AssertScriptAsync("document.querySelector('.plantuml').textContent.length > 0 && !document.querySelector('.plantuml svg')",
+                "Failed diagrams must retain their source.");
+            await page.UpdateAndCompleteAsync(DiagramSupport.RenderStandalone("good.puml", "@startuml\nAlice -> Bob : Recovered\n@enduml"), 2);
+            await page.AssertScriptAsync("document.querySelector('.plantuml svg').textContent.includes('Recovered')", "A failed renderer must recover on the next edit.");
+            await page.AssertLocalPlantUmlRequestsAsync();
+        });
+
+        [TestMethod]
+        [DoNotParallelize]
+        [Timeout(90000)]
+        public Task PlantUml_Export_EmbedsPortableSvgWithoutExecutingTemplateScripts() => RunAsync(async page =>
+        {
+            string html = "<!doctype html><html><head><title>Export</title></head><body>" +
+                "<script>window.__exportTemplateExecuted=true;</script><a href=\"guide.html\">Guide</a>" +
+                DiagramSupport.RenderStandalone("export.puml", "@startuml\nAlice -> Bob : Exported\n@enduml") +
+                "</body></html>";
+            string exported = await page.ExportPlantUmlAsync(html, "forest");
+            StringAssert.Contains(exported, "<svg");
+            StringAssert.Contains(exported, "Exported");
+            StringAssert.Contains(exported, "guide.html");
+            Assert.IsFalse(exported.Contains("plantuml-preview.js"), "Exported HTML must not depend on the extension runtime.");
+            await page.AssertScriptAsync("!window.__exportTemplateExecuted", "Custom template scripts must remain inert during export.");
+            await page.NavigateAsync(exported, fullPage: true, verifyPreview: false);
+            await page.AssertScriptAsync("!!document.querySelector('.plantuml svg') && !window.MarkdownPlantUml", "Exported SVG must display without PlantUML scripts.");
+            await page.PrintPlantUmlPdfAsync();
+        });
+
+        [TestMethod]
+        [DoNotParallelize]
+        [Timeout(90000)]
+        public Task PlantUml_MixedFeaturesAndRapidEdits_AwaitFinalContent() => RunAsync(async page =>
+        {
+            string diagram = DiagramSupport.RenderStandalone("mixed.puml", "@startuml\nAlice -> Bob : Initial\n@enduml");
+            await page.NavigateAsync(Sample + diagram);
+            await page.InitializeAsync(1);
+            await page.CompleteAsync(1);
+            await page.AssertScriptAsync("!!document.querySelector('.mermaid svg') && !!document.querySelector('.math mjx-container') && " +
+                "!!document.querySelector('code .token') && !!document.querySelector('.plantuml svg')",
+                "PlantUML must coexist with real Mermaid, MathJax and Prism.");
+            await page.ScriptAsync(@"var originalPlantRender = MarkdownPlantUml.render.bind(MarkdownPlantUml);
+                var plantGate = new Promise(resolve => window.__releasePlantRender = resolve);
+                MarkdownPlantUml.render = async function(nodes, theme) {
+                    window.__plantRenderBlocked = true; await plantGate; await originalPlantRender(nodes, theme);
+                };");
+            await page.UpdateAsync(Sample + diagram.Replace("Initial", "Middle"), 2);
+            await page.UntilAsync("window.__plantRenderBlocked === true", "delayed PlantUML render");
+            await page.UpdateAsync("<p>Discarded</p>", 3);
+            await page.UpdateAsync(Sample + diagram.Replace("Initial", "Final"), 4);
+            Assert.IsFalse(page.HasCompletion(2), "The active render must not be acknowledged before it finishes.");
+            Assert.IsFalse(page.HasCompletion(4), "The final render must wait for the active request.");
+            await page.ScriptAsync("__releasePlantRender()");
+            await page.CompleteAsync(2);
+            await page.CompleteAsync(4);
+            Assert.IsFalse(page.HasCompletion(3), "The intermediate pending request must be coalesced.");
+            await page.AssertScriptAsync("document.querySelector('.plantuml svg').textContent.includes('Final') && " +
+                "!document.getElementById('___markdown-content___').textContent.includes('Discarded')",
+                "The final edit must survive deferred diagram rendering.");
+            page.AssertNoErrors();
+        });
+
+        [TestMethod]
+        [DataRow("@startuml\nthis is not valid plantuml\n@enduml")]
+        [DataRow("@startuml\n!include external.puml\nAlice -> Bob\n@enduml")]
+        [DoNotParallelize]
+        [Timeout(90000)]
+        public Task PlantUml_Export_RenderFailureAbortsSvgMaterialization(string source) => RunAsync(async page =>
+        {
+            string html = "<html><head></head><body>" + DiagramSupport.RenderStandalone("bad.puml", source) + "</body></html>";
+            InvalidOperationException failure = await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => page.ExportPlantUmlAsync(html, "forest"));
+            StringAssert.Contains(failure.Message, "PlantUML");
+        });
 
         [TestMethod]
         [DataRow(true, "light")]
@@ -470,7 +664,42 @@ namespace MarkdownEditor2022.UnitTests
                 _view.CoreWebView2.WebMessageReceived += (_, args) => _messages.Add(args.TryGetWebMessageAsString());
             }
 
-            internal async Task NavigateAsync(string html, bool fullPage = false)
+            internal Task<string> ExportPlantUmlAsync(string html, string theme) =>
+                PlantUmlExportService.RenderInBrowserAsync(_view!.CoreWebView2, html, theme);
+
+            internal async Task PrintPlantUmlPdfAsync()
+            {
+                string file = Path.Combine(_userData, "plantuml-export.pdf");
+                await ScriptAsync("window.__markdownEditorReady=true");
+                await PdfExportService.PrintRenderedToPdfAsync(_view!.CoreWebView2, file);
+                Assert.IsTrue(File.Exists(file), "PDF export must persist a document after SVG rendering.");
+                byte[] bytes = File.ReadAllBytes(file);
+                Assert.IsTrue(bytes.Length > 1000, "The PDF must contain actual diagram content.");
+                Assert.AreEqual("%PDF", Encoding.ASCII.GetString(bytes, 0, 4));
+                File.Delete(file);
+            }
+
+            internal async Task AssertLocalPlantUmlRequestsAsync()
+            {
+                await AssertScriptAsync("Array.from(MarkdownPlantUml.resourceUrls).some(url => url.endsWith('/plantuml/plantuml.js')) && " +
+                    "Array.from(MarkdownPlantUml.resourceUrls).every(url => url.startsWith('http://markdown-editor-host/'))",
+                    "The real PlantUML engine and resources must load exclusively from the virtual host.");
+            }
+
+            internal async Task FailedAsync(int id)
+            {
+                Stopwatch timer = Stopwatch.StartNew();
+                while (!_messages.Contains("previewFailed:" + id))
+                {
+                    _deadline.ThrowIfCancellationRequested();
+                    Assert.IsFalse(HasCompletion(id), "Invalid PlantUML must not acknowledge success. " +
+                        await ScriptAsync("document.querySelector('.plantuml').innerHTML"));
+                    Assert.IsTrue(timer.Elapsed < TimeSpan.FromSeconds(25), "Missing PlantUML failure: " + string.Join("; ", _messages));
+                    await Task.Delay(20, _deadline);
+                }
+            }
+
+            internal async Task NavigateAsync(string html, bool fullPage = false, bool verifyPreview = true)
             {
                 TaskCompletionSource<bool> navigated = new(TaskCreationOptions.RunContinuationsAsynchronously);
                 void OnNavigation(object? sender, CoreWebView2NavigationCompletedEventArgs args)
@@ -483,10 +712,59 @@ namespace MarkdownEditor2022.UnitTests
                 {
                     _view.NavigateToString(fullPage ? html : PreviewTemplate.Replace("[content]", html).Replace("[scripts]", string.Empty));
                     await WithinAsync(navigated.Task, "navigate to preview");
-                    await AssertScriptAsync("typeof __initializeMarkdownPreview === 'function' && typeof __updateMarkdownPreview === 'function'",
-                        "The native preview-content.js entry points were not installed.");
+                    if (verifyPreview)
+                        await AssertScriptAsync("typeof __initializeMarkdownPreview === 'function' && typeof __updateMarkdownPreview === 'function'",
+                            "The native preview-content.js entry points were not installed.");
                 }
                 finally { _view.CoreWebView2.NavigationCompleted -= OnNavigation; }
+            }
+
+            internal async Task WithPendingImageAsync(string html, Browser browser, Func<Task> assertion)
+            {
+                const string image = "https://pending-preview-image.invalid/image.png";
+                TaskCompletionSource<bool> requested = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                TaskCompletionSource<bool> domReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                FieldInfo navigationCompletion = typeof(Browser).GetField("_navigationCompletion", BindingFlags.Instance | BindingFlags.NonPublic)!;
+                FieldInfo navigationId = typeof(Browser).GetField("_navigationId", BindingFlags.Instance | BindingFlags.NonPublic)!;
+                MethodInfo onDomReady = typeof(Browser).GetMethod("OnDomContentLoaded", BindingFlags.Instance | BindingFlags.NonPublic)!;
+                EventHandler<CoreWebView2DOMContentLoadedEventArgs> onDomContentLoaded =
+                    (EventHandler<CoreWebView2DOMContentLoadedEventArgs>)Delegate.CreateDelegate(
+                        typeof(EventHandler<CoreWebView2DOMContentLoadedEventArgs>), browser, onDomReady);
+                void OnStarting(object? sender, CoreWebView2NavigationStartingEventArgs args) =>
+                    navigationId.SetValue(browser, args.NavigationId);
+                CoreWebView2Deferral? deferral = null;
+                void OnResource(object? sender, CoreWebView2WebResourceRequestedEventArgs args)
+                {
+                    if (args.Request.Uri != image) return;
+                    deferral = args.GetDeferral();
+                    args.Response = _environment!.CreateWebResourceResponse(null, 404, "Not Found", "");
+                    requested.TrySetResult(true);
+                }
+                _view!.CoreWebView2.AddWebResourceRequestedFilter(image, CoreWebView2WebResourceContext.Image);
+                _view.CoreWebView2.WebResourceRequested += OnResource;
+                navigationCompletion.SetValue(browser, domReady);
+                _view.CoreWebView2.NavigationStarting += OnStarting;
+                _view.CoreWebView2.DOMContentLoaded += onDomContentLoaded;
+                try
+                {
+                    _view.NavigateToString(html);
+                    await WithinAsync(requested.Task, "request deliberately pending image");
+                    Assert.IsTrue(await WithinAsync(domReady.Task, "production host DOM readiness"),
+                        "The production host must become ready without waiting for the pending image.");
+                    await UntilAsync("typeof __initializeMarkdownPreview === 'function'", "install preview while image is pending");
+                    await assertion();
+                    await AssertScriptAsync("document.readyState !== 'complete'",
+                        "The test must keep the image pending until after the diagrams render.");
+                }
+                finally
+                {
+                    deferral?.Dispose();
+                    _view.CoreWebView2.NavigationStarting -= OnStarting;
+                    _view.CoreWebView2.DOMContentLoaded -= onDomContentLoaded;
+                    navigationCompletion.SetValue(browser, null);
+                    _view.CoreWebView2.WebResourceRequested -= OnResource;
+                    _view.CoreWebView2.RemoveWebResourceRequestedFilter(image, CoreWebView2WebResourceContext.Image);
+                }
             }
 
             internal Task InitializeAsync(int id) => AssertScriptAsync($"__initializeMarkdownPreview('default', {id}) === true", "Initialize must immediately accept the request.");

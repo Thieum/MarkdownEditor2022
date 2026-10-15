@@ -1,0 +1,15 @@
+PlantUML JavaScript engine: @plantuml/core 1.2026.8, MIT (see LICENSE).
+Viz.js: see viz-LICENSE.txt. Graphviz/Expat original sources and their license
+notices are supplied in graphviz-sources.tar.gz and expat-sources.tar.gz.
+Themes, emoji and OpenIconic: see the engine LICENSE and original resource headers.
+OpenIconic graphics: Copyright (c) 2014 Waybury, MIT (openiconic-LICENSE.txt).
+Twemoji graphics: Copyright Twitter, Inc. and other contributors, CC-BY-4.0
+(twemoji-LICENSE.txt; https://github.com/twitter/twemoji and
+https://creativecommons.org/licenses/by/4.0/). PlantUML converts these graphics
+into its bundled sprite representation.
+Standard libraries: separately licensed; their original metadata is retained in each
+*.min.js bundle. Original sources, copyright and license notices are supplied in
+stdlib-sources.zip (plantuml/plantuml-stdlib commit 7167ca01416dac036fb11a72898ad7cbd008031a).
+The engine MIT license does not relicense those libraries or their icons.
+Release resources: https://github.com/plantuml/plantuml/releases/download/v1.2026.8/js-plantuml-1.2026.8.zip
+Standard-library sources: https://github.com/plantuml/plantuml-stdlib/archive/7167ca01416dac036fb11a72898ad7cbd008031a.zip

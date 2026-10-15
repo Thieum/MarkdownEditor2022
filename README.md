@@ -29,7 +29,7 @@ This extension delivers a full featured Markdown editor with live preview, synta
 
 - Powered by [Markdig](https://github.com/lunet-io/markdig), providing the best available Markdown parser.
 - Syntax highlighting powered by Prism.js keeps fenced code blocks readable.
-- Supports CommonMark, GitHub flavored Markdown, FrontMatter YAML, Mermaid, and math notation.
+- Supports CommonMark, GitHub flavored Markdown, FrontMatter YAML, Mermaid, PlantUML, and math notation.
 - Brace completion with type-through maintains list formatting and block structure.
 - Lightning fast performance even in large documentation sets.
 
@@ -77,6 +77,9 @@ Use the document toolbar to select a mode directly. `F7` cycles from Source to S
 ![Preview window](art/preview-window-dark.png)
 
 Every time the markdown document is modified, the preview window will update.
+
+Diagram rendering and live updates do not wait for ordinary Markdown images to
+finish loading.
 
 The preview window is automatically scrolled to match the scroll position of the document. As the document is scrolled up and down, the preview window will follow.
 
@@ -174,6 +177,74 @@ In addition to Mermaid code blocks in Markdown, the extension also supports stan
 - Live preview rendering the diagram
 
 This is useful when you want to maintain complex diagrams as separate files or share them across multiple documents.
+
+### PlantUML diagram support
+
+PlantUML diagrams render entirely in the preview's JavaScript engine. No Java,
+native Graphviz installation, diagram server, or internet connection is required.
+Use a `plantuml` or `puml` code fence with explicit diagram markers:
+
+````markdown
+```plantuml
+@startuml
+Alice -> Bob : Request
+Bob --> Alice : Response
+@enduml
+```
+````
+
+Standard-library diagrams work offline too, including C4:
+
+````markdown
+```puml
+@startuml
+!include <C4/C4_Context>
+Person(user, "User")
+System(app, "Application")
+Rel(user, app, "Uses")
+@enduml
+```
+````
+
+Open standalone `.puml` and `.plantuml` files to use the same Source, Split,
+and Preview modes, file icons, live updates, and basic comment highlighting.
+Use one diagram per code fence or standalone file, with its explicit
+`@start...` and `@end...` markers. Diagrams follow the selected light/dark
+preview theme. A full PlantUML language service is not included.
+
+The extension bundles Viz.js/Graphviz, the available standard-library bundles,
+themes, emoji, and OpenIconic resources and loads them only when needed.
+Local-file includes, URL includes, and external theme sources are not supported;
+use bundled `!include <...>` resources instead. Invalid diagrams retain their
+source in preview and report a rendering error. JavaScript PlantUML is an
+upstream beta build; it does not guarantee every feature of the Java renderer.
+
+Generated HTML embeds completed PlantUML SVG rather than referring to the
+extension's JavaScript files. The diagrams remain viewable offline when the
+HTML is moved; unrelated Markdown images and stylesheets keep their usual
+resource requirements. PDF export also waits for completed diagrams.
+Rendering failures abort the export rather than producing incomplete diagrams.
+
+#### Updating the bundled PlantUML runtime
+
+Run from the repository:
+
+```powershell
+.\scripts\download-latest-plantumljs.ps1
+```
+
+The updater requires PowerShell 5.1 or later, `tar.exe`, and internet access
+to npm, GitHub, unpkg, and the Graphviz source distribution host. It downloads
+the latest stable MIT-licensed `@plantuml/core` engine, matching offline
+libraries, and original dependency source/license archives. It checks npm
+integrity, records file hashes and pinned provenance in
+`src\Margin\plantuml\version.json`, and replaces the bundle only after all
+downloads succeed. It does not install npm packages or require Java.
+To reproduce a particular supported release, pass `-Version 1.2026.8`.
+
+The full offline distribution and original source/license archives increase
+the VSIX size substantially. Standard libraries and icons have their own
+licenses; see the bundled `NOTICE.txt`, `LICENSE`, and source archives.
 
 ### Root path configuration for Jekyll/GitHub Pages
 
