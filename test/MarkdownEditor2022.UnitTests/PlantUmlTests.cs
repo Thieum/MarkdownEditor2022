@@ -6,7 +6,7 @@ namespace MarkdownEditor2022.UnitTests
     public sealed class PlantUmlTests
     {
         [TestMethod]
-        public async Task HtmlGenerationService_DelayedOlderGenerationCannotOverwriteNewerOutput()
+        public async Task HtmlGenerationService_DelayedOlderGenerationCannotOverwriteNewerOutputAsync()
         {
             using GenerationFixture fixture = new();
             object oldGeneration = HtmlGenerationService.BeginGeneration(fixture.SourcePath);
@@ -238,7 +238,7 @@ namespace MarkdownEditor2022.UnitTests
         public void PlantUmlCommentClassifier_FindComments_FindsSingleLineComments()
         {
             string source = "Alice -> Bob ' first\nnote ' second\n";
-            var expected = new[]
+            (int, int Length)[] expected = new[]
             {
                 (source.IndexOf("' first", StringComparison.Ordinal), "' first".Length),
                 (source.IndexOf("' second", StringComparison.Ordinal), "' second".Length)
@@ -253,7 +253,7 @@ namespace MarkdownEditor2022.UnitTests
             string source = "before\n/' block\nstill block '/ after\n";
             int start = source.IndexOf("/'", StringComparison.Ordinal);
             int end = source.IndexOf("'/", start + 2, StringComparison.Ordinal) + 2;
-            var comments = PlantUmlCommentClassifier.FindComments(source).ToArray();
+            (int start, int length)[] comments = PlantUmlCommentClassifier.FindComments(source).ToArray();
 
             CollectionAssert.AreEqual(new[] { (start, end - start) }, comments);
             Assert.AreEqual("/' block\nstill block '/", source.Substring(comments[0].start, comments[0].length));
@@ -265,7 +265,7 @@ namespace MarkdownEditor2022.UnitTests
         {
             string source = "Alice \"say \\\"'still quoted'\\\" /' also quoted '/\" -> Bob\nnote ' real\n";
             int start = source.IndexOf("' real", StringComparison.Ordinal);
-            var comments = PlantUmlCommentClassifier.FindComments(source).ToArray();
+            (int start, int length)[] comments = PlantUmlCommentClassifier.FindComments(source).ToArray();
 
             CollectionAssert.AreEqual(new[] { (start, "' real".Length) }, comments);
             Assert.AreEqual("' real", source.Substring(comments[0].start, comments[0].length));
@@ -286,13 +286,13 @@ namespace MarkdownEditor2022.UnitTests
         public void PlantUmlCommentClassifier_FindComments_UnterminatedCommentsExtendToLineOrEnd()
         {
             string lineSource = "Alice -> Bob ' unfinished";
-            var lineComments = PlantUmlCommentClassifier.FindComments(lineSource).ToArray();
+            (int start, int length)[] lineComments = PlantUmlCommentClassifier.FindComments(lineSource).ToArray();
             CollectionAssert.AreEqual(
                 new[] { (lineSource.IndexOf("'", StringComparison.Ordinal), lineSource.Length - lineSource.IndexOf("'", StringComparison.Ordinal)) },
                 lineComments);
 
             string blockSource = "before /' unfinished block";
-            var blockComments = PlantUmlCommentClassifier.FindComments(blockSource).ToArray();
+            (int start, int length)[] blockComments = PlantUmlCommentClassifier.FindComments(blockSource).ToArray();
             int blockStart = blockSource.IndexOf("/'", StringComparison.Ordinal);
             CollectionAssert.AreEqual(new[] { (blockStart, blockSource.Length - blockStart) }, blockComments);
             Assert.AreEqual("/' unfinished block", blockSource.Substring(blockComments[0].start, blockComments[0].length));

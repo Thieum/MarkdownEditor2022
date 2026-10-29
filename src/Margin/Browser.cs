@@ -14,6 +14,7 @@ using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
+using System.Windows.Interop;
 using System.Windows.Media;
 using Markdig.Extensions.Yaml;
 using Markdig.Renderers;
@@ -48,6 +49,7 @@ namespace MarkdownEditor2022
         private CancellationTokenSource _updateCancellation;
         private readonly SemaphoreSlim _updateGate = new(1, 1);
         private bool _browserReady;
+        private bool _browserInitializing;
         private bool _fullRefreshRequested = true;
         private string _lastRenderedHtml;
         private MarkdownDocument _lastRenderedMarkdown;
@@ -456,7 +458,7 @@ namespace MarkdownEditor2022
             _formatMapService = formatMapService;
             _currentViewLine = -1;
 
-            _browser.Initialized += BrowserInitialized;
+            _browser.Loaded += BrowserLoaded;
             _browser.NavigationStarting += BrowserNavigationStarting;
 
             // Set the WPF Background to match VS theme (WebView2 DefaultBackgroundColor is set after init)
@@ -475,7 +477,7 @@ namespace MarkdownEditor2022
             }
 
             // The update that owns this source disposes it after its continuation exits.
-            _browser.Initialized -= BrowserInitialized;
+            _browser.Loaded -= BrowserLoaded;
             _browser.NavigationStarting -= BrowserNavigationStarting;
 
             if (_browser.CoreWebView2 != null)
@@ -529,14 +531,26 @@ namespace MarkdownEditor2022
                 : CoreWebView2PreferredColorScheme.Dark;
         }
 
-        private void BrowserInitialized(object sender, EventArgs e)
+        private bool HasBrowserHost => _browser.IsLoaded &&
+            PresentationSource.FromVisual(_browser) is HwndSource source && source.Handle != IntPtr.Zero;
+
+        private void BrowserLoaded(object sender, RoutedEventArgs e)
         {
+            if (_isDisposed || _browserReady || _browserInitializing || !HasBrowserHost)
+            {
+                return;
+            }
+
+            _browserInitializing = true;
             ThreadHelper.JoinableTaskFactory.RunAsync(async () =>
             {
                 try
                 {
                     CoreWebView2Environment environment = await GetOrCreateWebView2EnvironmentAsync();
-                    if (_isDisposed)
+                    await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
+
+                    // The editor may have been detached while the shared environment was created.
+                    if (_isDisposed || !HasBrowserHost)
                     {
                         return;
                     }
@@ -560,6 +574,10 @@ namespace MarkdownEditor2022
                 catch (Exception ex)
                 {
                     await ex.LogAsync();
+                }
+                finally
+                {
+                    _browserInitializing = false;
                 }
             }).FireAndForget();
         }
@@ -2056,7 +2074,8 @@ namespace MarkdownEditor2022
         {css}
         {themeColorCss}
         .markdown-table-wrapper {{max-width: 100%; margin: 0 0 16px; overflow-x: auto;}}
-        .markdown-table-wrapper > table {{display: table; width: max-content; max-width: none; margin-bottom: 0; overflow: visible;}}
+        .markdown-table-wrapper > table {{display: table; width: fit-content; max-width: 100%; margin-bottom: 0; overflow: visible;}}
+        .markdown-table-wrapper > table th, .markdown-table-wrapper > table td {{overflow-wrap: anywhere;}}
         .markdown-body img {{background-color: transparent;}}
         .plantuml:has(svg) {{white-space: normal; overflow-x: auto;}}
         .plantuml svg {{max-width: 100%; height: auto;}}
@@ -2669,6 +2688,14 @@ namespace MarkdownEditor2022
 
         internal sealed class PreviewWebView : WebView2CompositionControl
         {
+            protected override Size MeasureOverride(Size constraint)
+            {
+                base.MeasureOverride(constraint);
+                // The captured image is output, not a size request. Its device-pixel size
+                // must not grow the editor margin when WPF measures an unconstrained axis.
+                return new Size(0, 0);
+            }
+
             protected override void OnMouseDoubleClick(MouseButtonEventArgs e)
             {
                 // WebView2 1.0.3485.44 forwards both MouseDown and MouseDoubleClick as native

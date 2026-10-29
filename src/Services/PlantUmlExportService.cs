@@ -23,9 +23,15 @@ namespace MarkdownEditor2022.Services
             WebView2 view = new();
             Window window = new()
             {
-                Width = 1, Height = 1, Left = -30000, Top = -30000,
-                ShowActivated = false, ShowInTaskbar = false, WindowStyle = WindowStyle.None,
-                Content = view, Opacity = 0
+                Width = 1,
+                Height = 1,
+                Left = -30000,
+                Top = -30000,
+                ShowActivated = false,
+                ShowInTaskbar = false,
+                WindowStyle = WindowStyle.None,
+                Content = view,
+                Opacity = 0
             };
             try
             {
